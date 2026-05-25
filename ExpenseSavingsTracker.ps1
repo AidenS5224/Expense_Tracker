@@ -29,6 +29,17 @@ $script:DisplayedBalanceAccounts = @()
 $script:EditingId = $null
 $NewAccountOption = "New account..."
 
+function Reset-AppSettings {
+  $script:Settings = [pscustomobject]@{
+    WeekStartsOn = "Monday"
+    CurrencyCulture = "en-AU"
+    LeftGraphDefault = "Data Table"
+    RightGraphDefault = "Income vs Spend"
+  }
+}
+
+Reset-AppSettings
+
 $Categories = @{
   Expense = @("Rent / Mortgage", "Utilities", "Groceries", "Transport", "Insurance", "Medical", "Subscriptions", "Dining", "Personal", "Entertainment", "Debt", "Other")
   Saving = @("Emergency Fund", "Holiday", "Home", "Car", "Investment", "Other")
@@ -41,7 +52,39 @@ function New-EntryId {
 }
 
 function ConvertTo-Money([decimal]$Value) {
-  return $Value.ToString("C2", [Globalization.CultureInfo]::GetCultureInfo("en-AU"))
+  $cultureName = if ($script:Settings -and $script:Settings.CurrencyCulture) { [string]$script:Settings.CurrencyCulture } else { "en-AU" }
+  try {
+    return $Value.ToString("C2", [Globalization.CultureInfo]::GetCultureInfo($cultureName))
+  } catch {
+    return $Value.ToString("C2", [Globalization.CultureInfo]::GetCultureInfo("en-AU"))
+  }
+}
+
+function Get-GoalKind($goal) {
+  if ($goal -and $goal.GoalKind) { return [string]$goal.GoalKind }
+  return "Target"
+}
+
+function Get-GoalWeeklyAmount($goal) {
+  if (-not $goal) { return [decimal]0 }
+  if ((Get-GoalKind $goal) -eq "Weekly") {
+    if ($null -ne $goal.WeeklyAmount) { return [decimal]$goal.WeeklyAmount }
+    return [decimal]$goal.TargetAmount
+  }
+  return [decimal]0
+}
+
+function Test-WeeklyGoalActive($goal, [Nullable[datetime]]$asOfDate = $null) {
+  if ((Get-GoalKind $goal) -ne "Weekly") { return $false }
+  if (-not $asOfDate.HasValue) { $asOfDate = [datetime]::Today }
+  if ($goal.IsOngoing) { return $true }
+  if (-not $goal.ExpectedDate) { return $true }
+  return ([datetime]$goal.ExpectedDate).Date -ge $asOfDate.Value.Date
+}
+
+function Get-GoalSortDate($goal) {
+  if ($goal -and $goal.ExpectedDate) { return [datetime]$goal.ExpectedDate }
+  return [datetime]::MaxValue
 }
 
 function Get-AccountDisplayName([string]$account) {
@@ -378,8 +421,16 @@ function Get-GoalProgressRows {
   }
 
   $rows = New-Object System.Collections.ArrayList
-  foreach ($goal in @($script:Goals | Sort-Object Account, ExpectedDate)) {
+  foreach ($goal in @($script:Goals | Sort-Object Account, @{ Expression = { Get-GoalSortDate $_ } } )) {
     $account = [string]$goal.Account
+    if ((Get-GoalKind $goal) -eq "Weekly") {
+      [void]$rows.Add([pscustomobject]@{
+        Goal = $goal
+        Saved = [decimal]0
+        Remaining = if (Test-WeeklyGoalActive $goal) { Get-GoalWeeklyAmount $goal } else { [decimal]0 }
+      })
+      continue
+    }
     $available = if ($availableByAccount.ContainsKey($account)) { [decimal]$availableByAccount[$account] } else { [decimal]0 }
     $saved = [math]::Min([decimal]$goal.TargetAmount, $available)
     $availableByAccount[$account] = [math]::Max([decimal]0, $available - [decimal]$goal.TargetAmount)
@@ -624,6 +675,45 @@ function ConvertTo-WeeklyAmount([decimal]$amount, [string]$frequency) {
   }
 }
 
+function Get-RecurringIntervalDays([string]$frequency) {
+  switch ($frequency) {
+    "Weekly" { return 7 }
+    "Fortnightly" { return 14 }
+    "Monthly" { return 0 }
+    "Quarterly" { return 0 }
+    "Annual" { return 0 }
+    default { return -1 }
+  }
+}
+
+function Test-RecurringPaymentDueInRange($payment, [datetime]$rangeStart, [datetime]$rangeEnd) {
+  if (-not $payment -or $null -eq $payment.Date) { return $false }
+  $anchorDate = ([datetime]$payment.Date).Date
+  $frequency = [string]$payment.Frequency
+
+  if ($anchorDate -ge $rangeStart.Date -and $anchorDate -lt $rangeEnd.Date) { return $true }
+  if ($anchorDate -gt $rangeEnd.Date) { return $false }
+
+  $intervalDays = Get-RecurringIntervalDays $frequency
+  if ($intervalDays -gt 0) {
+    $daysSinceAnchor = [math]::Max(0, ($rangeStart.Date - $anchorDate).TotalDays)
+    $periods = [math]::Ceiling($daysSinceAnchor / $intervalDays)
+    $nextDate = $anchorDate.AddDays($periods * $intervalDays)
+    return ($nextDate -ge $rangeStart.Date -and $nextDate -lt $rangeEnd.Date)
+  }
+
+  if ($frequency -eq "Monthly" -or $frequency -eq "Quarterly" -or $frequency -eq "Annual") {
+    $monthStep = if ($frequency -eq "Monthly") { 1 } elseif ($frequency -eq "Quarterly") { 3 } else { 12 }
+    $nextDate = $anchorDate
+    while ($nextDate -lt $rangeStart.Date) {
+      $nextDate = $nextDate.AddMonths($monthStep)
+    }
+    return ($nextDate -ge $rangeStart.Date -and $nextDate -lt $rangeEnd.Date)
+  }
+
+  return $false
+}
+
 function Get-ProjectionSummary {
   $today = [datetime]::Today
   $recentStart = $today.AddDays(-90)
@@ -658,6 +748,10 @@ function Get-ProjectionSummary {
   $requiredWeekly = [decimal]0
   foreach ($row in Get-GoalProgressRows) {
     $goal = $row.Goal
+    if ((Get-GoalKind $goal) -eq "Weekly") {
+      if (Test-WeeklyGoalActive $goal $today) { $requiredWeekly += Get-GoalWeeklyAmount $goal }
+      continue
+    }
     $remaining = [decimal]$row.Remaining
     $daysLeft = [math]::Max(1, (([datetime]$goal.ExpectedDate - $today).TotalDays))
     $requiredWeekly += $remaining / ([decimal]$daysLeft / 7)
@@ -737,17 +831,21 @@ function Get-MinimumWeeklySavingsPlan([Nullable[datetime]]$asOfDate = $null, [ob
   $effectiveDate = if ($asOfDate.HasValue) { $asOfDate.Value } else { [datetime]::Today }
   if (-not $goalRows) { $goalRows = Get-GoalProgressRows }
 
-  $activeRows = @($goalRows |
-    Where-Object { [decimal]$_.Remaining -gt 0 } |
+  $weeklyRows = @($goalRows |
+    Where-Object { (Get-GoalKind $_.Goal) -eq "Weekly" -and (Test-WeeklyGoalActive $_.Goal $effectiveDate) -and (Get-GoalWeeklyAmount $_.Goal) -gt 0 } |
+    Sort-Object { Get-GoalSortDate $_.Goal })
+
+  $targetRows = @($goalRows |
+    Where-Object { (Get-GoalKind $_.Goal) -ne "Weekly" -and [decimal]$_.Remaining -gt 0 } |
     Sort-Object { [datetime]$_.Goal.ExpectedDate })
 
-  if ($activeRows.Count -eq 0) {
+  if ($targetRows.Count -eq 0 -and $weeklyRows.Count -eq 0) {
     return [pscustomobject]@{ MinimumWeeklyRate = [decimal]0; Rows = @(); Warning = "" }
   }
 
   $cumulativeRemaining = [decimal]0
   $minimumRate = [decimal]0
-  foreach ($row in $activeRows) {
+  foreach ($row in $targetRows) {
     $goal = $row.Goal
     $cumulativeRemaining += [decimal]$row.Remaining
     $weeksRemaining = [decimal][math]::Max(1, [math]::Floor((([datetime]$goal.ExpectedDate - $effectiveDate).TotalDays) / 7))
@@ -756,7 +854,7 @@ function Get-MinimumWeeklySavingsPlan([Nullable[datetime]]$asOfDate = $null, [ob
   }
 
   $rows = New-Object System.Collections.ArrayList
-  foreach ($row in $activeRows) {
+  foreach ($row in $targetRows) {
     $goal = $row.Goal
     $weeksRemaining = [decimal][math]::Max(1, [math]::Floor((([datetime]$goal.ExpectedDate - $effectiveDate).TotalDays) / 7))
     $requiredWeekly = [decimal]$row.Remaining / $weeksRemaining
@@ -770,8 +868,23 @@ function Get-MinimumWeeklySavingsPlan([Nullable[datetime]]$asOfDate = $null, [ob
     })
   }
 
+  $fixedWeekly = [decimal]0
+  foreach ($row in $weeklyRows) {
+    $goal = $row.Goal
+    $weeklyAmount = Get-GoalWeeklyAmount $goal
+    $fixedWeekly += $weeklyAmount
+    [void]$rows.Add([pscustomobject]@{
+      GoalId = $goal.Id
+      GoalName = $goal.Name
+      TargetDate = if ($goal.IsOngoing) { [datetime]::MaxValue } else { [datetime]$goal.ExpectedDate }
+      Remaining = [decimal]0
+      RequiredWeekly = $weeklyAmount
+      Mode = if ($goal.Mode) { [string]$goal.Mode } else { "Save" }
+    })
+  }
+
   return [pscustomobject]@{
-    MinimumWeeklyRate = $minimumRate
+    MinimumWeeklyRate = $minimumRate + $fixedWeekly
     Rows = @($rows)
     Warning = ""
   }
@@ -783,15 +896,31 @@ function Get-MinimumSavingsProjection {
   })
   $plan = Get-MinimumWeeklySavingsPlan -asOfDate ([datetime]::Today) -goalRows $goalRows
   $weeklyRate = [decimal]$plan.MinimumWeeklyRate
-  $latestDue = @($script:Goals | Sort-Object ExpectedDate -Descending | Select-Object -First 1)[0]
+  $latestDue = @($script:Goals | Where-Object { -not $_.IsOngoing } | Sort-Object ExpectedDate -Descending | Select-Object -First 1)[0]
   $maxWeeks = if ($latestDue) { [math]::Max(12, [math]::Ceiling((([datetime]$latestDue.ExpectedDate - [datetime]::Today).TotalDays) / 7)) } else { 12 }
+  if (@($script:Goals | Where-Object { (Get-GoalKind $_) -eq "Weekly" -and $_.IsOngoing }).Count -gt 0) {
+    $maxWeeks = [math]::Max($maxWeeks, 52)
+  }
   $maxWeeks = [math]::Min(104, $maxWeeks)
   $points = New-Object System.Collections.ArrayList
 
   for ($week = 0; $week -le $maxWeeks; $week++) {
     $date = [datetime]::Today.AddDays($week * 7)
     $remainingBudget = $weeklyRate
-    foreach ($goalRow in @($goalRows | Where-Object { [decimal]$_.Remaining -gt 0 } | Sort-Object { [datetime]$_.Goal.ExpectedDate })) {
+    foreach ($goalRow in @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -eq "Weekly" -and (Test-WeeklyGoalActive $_.Goal $date) } | Sort-Object { Get-GoalSortDate $_.Goal })) {
+      $allocation = [math]::Min($remainingBudget, (Get-GoalWeeklyAmount $goalRow.Goal))
+      if ($allocation -le 0) { continue }
+      [void]$points.Add([pscustomobject]@{
+        Week = $week
+        Date = $date
+        GoalId = $goalRow.Goal.Id
+        GoalName = $goalRow.Goal.Name
+        Allocation = [decimal]$allocation
+        TotalAllocated = [decimal]$weeklyRate
+      })
+      $remainingBudget -= $allocation
+    }
+    foreach ($goalRow in @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -ne "Weekly" -and [decimal]$_.Remaining -gt 0 } | Sort-Object { [datetime]$_.Goal.ExpectedDate })) {
       if ($remainingBudget -le 0) { break }
       $allocation = [math]::Min([decimal]$goalRow.Remaining, $remainingBudget)
       if ($allocation -le 0) { continue }
@@ -806,7 +935,9 @@ function Get-MinimumSavingsProjection {
       $goalRow.Remaining = [math]::Max([decimal]0, [decimal]$goalRow.Remaining - $allocation)
       $remainingBudget -= $allocation
     }
-    if (@($goalRows | Where-Object { [decimal]$_.Remaining -gt 0 }).Count -eq 0) { break }
+    $hasTargetRemaining = @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -ne "Weekly" -and [decimal]$_.Remaining -gt 0 }).Count -gt 0
+    $hasActiveWeekly = @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -eq "Weekly" -and (Test-WeeklyGoalActive $_.Goal $date.AddDays(7)) }).Count -gt 0
+    if (-not $hasTargetRemaining -and -not $hasActiveWeekly) { break }
   }
 
   return [pscustomobject]@{
@@ -1005,8 +1136,23 @@ function Save-Entries {
     hiddenBalanceAccounts = @($script:HiddenBalanceAccounts.Keys)
     accountNames = [pscustomobject]$script:AccountNames
     accountBalances = [pscustomobject]$script:AccountBalances
+    settings = $script:Settings
   }
   $payload | ConvertTo-Json -Depth 6 | Set-Content -Path $DataPath -Encoding UTF8
+}
+
+function New-AutoBackup([string]$reason) {
+  if (-not (Test-Path $DataPath)) { return $null }
+  $backupDir = Join-Path $AppDir "backups"
+  if (-not (Test-Path $backupDir)) {
+    New-Item -ItemType Directory -Path $backupDir | Out-Null
+  }
+  $safeReason = ([string]$reason) -replace "[^A-Za-z0-9_-]+", "-"
+  if ([string]::IsNullOrWhiteSpace($safeReason)) { $safeReason = "backup" }
+  $fileName = "auto-$safeReason-$((Get-Date).ToString('yyyyMMdd-HHmmss')).json"
+  $backupPath = Join-Path $backupDir $fileName
+  Copy-Item -Path $DataPath -Destination $backupPath -Force
+  return $backupPath
 }
 
 function Load-Entries {
@@ -1019,6 +1165,7 @@ function Load-Entries {
   $script:AllocationHistory = @{}
   $script:WeeklyAvailableSavings = [decimal]0
   $script:HiddenBalanceAccounts = @{}
+  Reset-AppSettings
   if (Test-Path $DataPath) {
     try {
       $json = Get-Content -Path $DataPath -Raw | ConvertFrom-Json
@@ -1049,6 +1196,9 @@ function Load-Entries {
           TargetAmount = [decimal]$goal.TargetAmount
           ExpectedDate = if ($goal.ExpectedDate) { [datetime]$goal.ExpectedDate } else { [datetime]::Today }
           Mode = if ($goal.Mode) { [string]$goal.Mode } else { "Save" }
+          GoalKind = if ($goal.GoalKind) { [string]$goal.GoalKind } else { "Target" }
+          WeeklyAmount = if ($null -ne $goal.WeeklyAmount) { [decimal]$goal.WeeklyAmount } else { [decimal]0 }
+          IsOngoing = if ($null -ne $goal.IsOngoing) { [bool]$goal.IsOngoing } else { $false }
           Note = if ($goal.Note) { [string]$goal.Note } else { "" }
         })
       }
@@ -1056,6 +1206,12 @@ function Load-Entries {
         foreach ($property in $json.accountNames.PSObject.Properties) {
           $script:AccountNames[[string]$property.Name] = [string]$property.Value
         }
+      }
+      if ($json.settings) {
+        if ($json.settings.WeekStartsOn) { $script:Settings.WeekStartsOn = [string]$json.settings.WeekStartsOn }
+        if ($json.settings.CurrencyCulture) { $script:Settings.CurrencyCulture = [string]$json.settings.CurrencyCulture }
+        if ($json.settings.LeftGraphDefault) { $script:Settings.LeftGraphDefault = [string]$json.settings.LeftGraphDefault }
+        if ($json.settings.RightGraphDefault) { $script:Settings.RightGraphDefault = [string]$json.settings.RightGraphDefault }
       }
       foreach ($key in @($json.recurringExclusions)) {
         if (-not [string]::IsNullOrWhiteSpace([string]$key)) {
@@ -1108,6 +1264,9 @@ function Load-Entries {
             TargetAmount = [decimal]$entry.Goal
             ExpectedDate = $entry.Date.AddMonths(12)
             Mode = "Save"
+            GoalKind = "Target"
+            WeeklyAmount = [decimal]0
+            IsOngoing = $false
             Note = "Migrated from old savings entry goal"
           })
         }
@@ -1128,7 +1287,7 @@ function Load-Entries {
     Id = New-EntryId; Type = "Saving"; Date = [datetime]::Today; Name = "Emergency fund"; Category = "Emergency Fund"; Account = "Savings"; Frequency = ""; Amount = [decimal]250; Goal = [decimal]5000; Note = ""; Balance = [decimal]0; BankCategory = ""; Serial = ""; Source = ""; ImportKey = ""
   })
   [void]$script:Goals.Add([pscustomobject]@{
-    Id = New-EntryId; Name = "Emergency fund"; Account = "Savings"; TargetAmount = [decimal]5000; ExpectedDate = [datetime]::Today.AddMonths(12); Mode = "Save"; Note = "Starter savings goal"
+    Id = New-EntryId; Name = "Emergency fund"; Account = "Savings"; TargetAmount = [decimal]5000; ExpectedDate = [datetime]::Today.AddMonths(12); Mode = "Save"; GoalKind = "Target"; WeeklyAmount = [decimal]0; IsOngoing = $false; Note = "Starter savings goal"
   })
   Save-Entries
 }
@@ -1167,6 +1326,75 @@ function Get-SummaryEntries {
     (($month -eq "All Months") -or ($_.Date.ToString("yyyy-MM") -eq $month)) -and
     (($account -eq "All Accounts") -or ($_.Account -eq $account))
   })
+}
+
+function Get-CurrentBudgetWeekRange {
+  $today = [datetime]::Today
+  $weekStartsOn = if ($script:Settings -and $script:Settings.WeekStartsOn) { [string]$script:Settings.WeekStartsOn } else { "Monday" }
+  $startDay = switch ($weekStartsOn) {
+    "Sunday" { [int][DayOfWeek]::Sunday }
+    default { [int][DayOfWeek]::Monday }
+  }
+  $daysSinceStart = (([int]$today.DayOfWeek - $startDay + 7) % 7)
+  $start = $today.AddDays(-1 * $daysSinceStart).Date
+  return [pscustomobject]@{
+    Start = $start
+    End = $start.AddDays(7)
+    Label = "$($start.ToString('dd/MM/yyyy')) - $($start.AddDays(6).ToString('dd/MM/yyyy'))"
+  }
+}
+
+function Get-ThisWeekBudgetSummary([string]$selectedAccount = "All Accounts") {
+  $week = Get-CurrentBudgetWeekRange
+  $items = @($script:Entries | Where-Object {
+    $entryDate = if ($null -ne $_.Date) { [datetime]$_.Date } else { [datetime]::MinValue }
+    $entryDate -ge [datetime]$week.Start -and
+    $entryDate -lt [datetime]$week.End -and
+    (($selectedAccount -eq "All Accounts") -or ($_.Account -eq $selectedAccount))
+  })
+
+  $paycheck = [decimal](@($items | Where-Object { $_.Type -eq "Income" } | Measure-Object Amount -Sum).Sum)
+
+  $goalRows = Get-GoalProgressRows
+  if ($selectedAccount -ne "All Accounts") {
+    $goalRows = @($goalRows | Where-Object { [string]$_.Goal.Account -eq $selectedAccount })
+  }
+  $minimumPlan = Get-MinimumWeeklySavingsPlan -goalRows $goalRows
+  $savings = [decimal]$minimumPlan.MinimumWeeklyRate
+  $spend = [decimal](@($items | Where-Object { $_.Type -eq "Expense" -and -not (Test-InternalTransfer $_) } | Measure-Object Amount -Sum).Sum)
+  $billTransactions = [decimal](@($items | Where-Object { $_.Type -eq "Bill" -and -not (Test-InternalTransfer $_) } | Measure-Object Amount -Sum).Sum)
+
+  $recurringBills = [decimal]0
+  foreach ($payment in Get-RecurringPayments) {
+    if ($selectedAccount -ne "All Accounts" -and [string]$payment.Account -ne $selectedAccount) { continue }
+    if (Test-RecurringPaymentDueInRange $payment ([datetime]$week.Start) ([datetime]$week.End)) {
+      $recurringBills += [decimal]$payment.Amount
+    }
+  }
+  $bills = $billTransactions + $recurringBills
+  $remaining = $paycheck - $savings - $spend - $bills
+
+  return [pscustomobject]@{
+    Week = $week
+    Paycheck = $paycheck
+    Savings = $savings
+    Spend = $spend
+    Bills = $bills
+    Remaining = $remaining
+  }
+}
+
+function Get-ThisWeekBudgetRows([string]$selectedAccount = "All Accounts") {
+  $budget = Get-ThisWeekBudgetSummary $selectedAccount
+
+  return @(
+    [pscustomobject]@{ Item = "Week"; Amount = ""; Detail = [string]$budget.Week.Label }
+    [pscustomobject]@{ Item = "Paycheck"; Amount = ConvertTo-Money ([decimal]$budget.Paycheck); Detail = "Income marked inside this Monday budget week" }
+    [pscustomobject]@{ Item = "Savings"; Amount = ConvertTo-Money ([decimal]$budget.Savings); Detail = "Minimum weekly saving to hit active goals" }
+    [pscustomobject]@{ Item = "Spend"; Amount = ConvertTo-Money ([decimal]$budget.Spend); Detail = "Expenses, excluding transfers" }
+    [pscustomobject]@{ Item = "Bills"; Amount = ConvertTo-Money ([decimal]$budget.Bills); Detail = "Recurring payments due this week plus bill entries" }
+    [pscustomobject]@{ Item = "Remaining"; Amount = ConvertTo-Money ([decimal]$budget.Remaining); Detail = "Paycheck minus savings, spend, and bills" }
+  )
 }
 
 function Get-SelectedMonthRange {
@@ -1323,39 +1551,16 @@ function Refresh-Accounts {
 }
 
 function Refresh-Summary {
-  $items = Get-SummaryEntries
-  $spendItems = @($items | Where-Object { $_.Type -eq "Expense" -and -not (Test-InternalTransfer $_) })
-  $expenses = [decimal](@($spendItems | Measure-Object Amount -Sum).Sum)
-  $weekStart = [datetime]::Today.AddDays(-1 * ([int][datetime]::Today.DayOfWeek))
-  $weekEnd = $weekStart.AddDays(7)
-  $currentWeekBills = [decimal](@($script:Entries | Where-Object {
-    $_.Type -eq "Bill" -and
-    [datetime]$_.Date -ge $weekStart -and
-    [datetime]$_.Date -lt $weekEnd
-  } | Measure-Object Amount -Sum).Sum)
-  $recurringBills = [decimal]0
-  foreach ($payment in Get-RecurringPayments) {
-    $recurringBills += ConvertTo-WeeklyAmount ([decimal]$payment.Amount) ([string]$payment.Frequency)
-  }
-  $bills = $recurringBills + $currentWeekBills
-  $savings = [decimal](@($items | Where-Object Type -eq "Saving" | Measure-Object Amount -Sum).Sum)
-  $goalTotal = [decimal](@($script:Goals | Measure-Object TargetAmount -Sum).Sum)
-  $savedTotal = [decimal]0
-  foreach ($row in Get-GoalProgressRows) {
-    $savedTotal += [decimal]$row.Saved
-  }
-  $net = $savings - $expenses - $bills
-  $progress = if ($goalTotal -gt 0) { [math]::Round(($savedTotal / $goalTotal) * 100) } else { 0 }
-  $minimumPlan = Get-MinimumWeeklySavingsPlan
-  $projection = Get-ProjectionSummary
-  $distribution = Get-PaycheckDistribution $projection
-  $remainingBudget = [math]::Max([decimal]0, [decimal]$distribution.Paycheck - [decimal]$distribution.Recurring - [decimal]$minimumPlan.MinimumWeeklyRate)
+  $selectedAccount = if ($accountFilterCombo -and $accountFilterCombo.SelectedItem) { Get-AccountRawValue ([string]$accountFilterCombo.SelectedItem) } else { "All Accounts" }
+  $budget = Get-ThisWeekBudgetSummary $selectedAccount
+  $remainingBudget = [decimal]$budget.Remaining
 
   $remainingBudgetValue.Text = ConvertTo-Money $remainingBudget
-  $savedBalanceValue.Text = ConvertTo-Money $savedTotal
-  $billValue.Text = ConvertTo-Money $bills
-  $progressValue.Text = "$progress%"
-  $minimumWeeklyValue.Text = ConvertTo-Money ([decimal]$minimumPlan.MinimumWeeklyRate)
+  $remainingBudgetValue.ForeColor = if ($remainingBudget -lt 0) { [Drawing.Color]::FromArgb(180, 35, 24) } else { [Drawing.Color]::FromArgb(32, 128, 79) }
+  $savedBalanceValue.Text = ConvertTo-Money ([decimal]$budget.Savings)
+  $billValue.Text = ConvertTo-Money ([decimal]$budget.Bills)
+  $progressValue.Text = ConvertTo-Money ([decimal]$budget.Paycheck)
+  $minimumWeeklyValue.Text = ConvertTo-Money ([decimal]$budget.Spend)
 }
 
 function Refresh-Chart {
@@ -1363,10 +1568,10 @@ function Refresh-Chart {
   $script:ChartDistributionCache = Get-PaycheckDistribution $script:ChartProjectionCache
   try {
     if ($chart) {
-      Render-Chart $chart $graphModeCombo $chartTitleLabel $projectionSummaryLabel
+      Render-Chart $chart $chartDataTable $graphModeCombo $chartTitleLabel $projectionSummaryLabel
     }
     if ($chart2) {
-      Render-Chart $chart2 $graphModeCombo2 $chartTitleLabel2 $projectionSummaryLabel2
+      Render-Chart $chart2 $chartDataTable2 $graphModeCombo2 $chartTitleLabel2 $projectionSummaryLabel2
     }
   } finally {
     $script:ChartProjectionCache = $null
@@ -1374,10 +1579,39 @@ function Refresh-Chart {
   }
 }
 
-function Render-Chart($chart, $graphModeCombo, $chartTitleLabel, $projectionSummaryLabel) {
+function Render-BudgetDataTable($dataTable, [string]$selectedAccount) {
+  if (-not $dataTable) { return }
+  $dataTable.Rows.Clear()
+  foreach ($row in Get-ThisWeekBudgetRows $selectedAccount) {
+    $rowIndex = $dataTable.Rows.Add()
+    $gridRow = $dataTable.Rows[$rowIndex]
+    $gridRow.Cells["BudgetItem"].Value = $row.Item
+    $gridRow.Cells["BudgetAmount"].Value = $row.Amount
+    $gridRow.Cells["BudgetDetail"].Value = $row.Detail
+    if ($row.Item -eq "Remaining" -and ([string]$row.Amount).StartsWith("-")) {
+      $gridRow.DefaultCellStyle.ForeColor = [Drawing.Color]::FromArgb(180, 35, 24)
+    }
+  }
+}
+
+function Render-Chart($chart, $dataTable, $graphModeCombo, $chartTitleLabel, $projectionSummaryLabel) {
   $chart.Series.Clear()
   $chart.Titles.Clear()
   $graphMode = if ($graphModeCombo -and $graphModeCombo.SelectedItem) { [string]$graphModeCombo.SelectedItem } else { "Savings Projection" }
+  $selectedAccount = if ($accountFilterCombo -and $accountFilterCombo.SelectedItem) { Get-AccountRawValue ([string]$accountFilterCombo.SelectedItem) } else { "All Accounts" }
+  if ($graphMode -eq "Data Table") {
+    if ($chartTitleLabel) { $chartTitleLabel.Text = "Data Table" }
+    if ($chart) { $chart.Visible = $false }
+    if ($dataTable) {
+      $dataTable.Visible = $true
+      Render-BudgetDataTable $dataTable $selectedAccount
+      $dataTable.BringToFront()
+    }
+    return
+  }
+  if ($chart) { $chart.Visible = $true }
+  if ($dataTable) { $dataTable.Visible = $false }
+
   $projection = if ($script:ChartProjectionCache) { $script:ChartProjectionCache } else { Get-ProjectionSummary }
   $distribution = if ($script:ChartDistributionCache) { $script:ChartDistributionCache } else { Get-PaycheckDistribution $projection }
   $effectiveWeeklySavings = [decimal]$distribution.AvailableForSavings
@@ -1474,7 +1708,6 @@ function Render-Chart($chart, $graphModeCombo, $chartTitleLabel, $projectionSumm
   }
 
   if ($chartTitleLabel) { $chartTitleLabel.Text = $graphMode }
-  $selectedAccount = if ($accountFilterCombo -and $accountFilterCombo.SelectedItem) { Get-AccountRawValue ([string]$accountFilterCombo.SelectedItem) } else { "All Accounts" }
   $isSavingsIncomeSpend = ($graphMode -eq "Income vs Spend" -and (Test-SavingsAccount $selectedAccount))
   $isCreditCardIncomeSpend = ($graphMode -eq "Income vs Spend" -and (Test-CreditCardAccount $selectedAccount))
   $scopeLabel = Get-ChartScopeLabel
@@ -1909,19 +2142,20 @@ function Refresh-Breakdowns {
   }
 
   $script:DisplayedGoalIds = @()
-  foreach ($goalRow in @(Get-GoalProgressRows | Sort-Object { $_.Goal.ExpectedDate })) {
+  foreach ($goalRow in @(Get-GoalProgressRows | Sort-Object { Get-GoalSortDate $_.Goal })) {
     $goal = $goalRow.Goal
     $saved = [decimal]$goalRow.Saved
-    $pct = if ($goal.TargetAmount -gt 0) { [math]::Min(100, [math]::Round(($saved / $goal.TargetAmount) * 100)) } else { 0 }
+    $isWeeklyGoal = ((Get-GoalKind $goal) -eq "Weekly")
+    $pct = if ($isWeeklyGoal) { "--" } elseif ($goal.TargetAmount -gt 0) { "$([math]::Min(100, [math]::Round(($saved / $goal.TargetAmount) * 100)))%" } else { "0%" }
     $mode = if ($goal.Mode) { [string]$goal.Mode } else { "Save" }
     $rowIndex = $goalsList.Rows.Add()
     $gridRow = $goalsList.Rows[$rowIndex]
     $gridRow.Cells["GoalName"].Value = $goal.Name
     $gridRow.Cells["GoalMode"].Value = $mode
-    $gridRow.Cells["GoalProgress"].Value = "$pct%"
-    $gridRow.Cells["GoalSaved"].Value = ConvertTo-Money $saved
-    $gridRow.Cells["GoalTarget"].Value = ConvertTo-Money $goal.TargetAmount
-    $gridRow.Cells["GoalDate"].Value = $goal.ExpectedDate.ToString("dd/MM/yy")
+    $gridRow.Cells["GoalProgress"].Value = $pct
+    $gridRow.Cells["GoalSaved"].Value = if ($isWeeklyGoal) { "Weekly" } else { ConvertTo-Money $saved }
+    $gridRow.Cells["GoalTarget"].Value = if ($isWeeklyGoal) { ConvertTo-Money (Get-GoalWeeklyAmount $goal) } else { ConvertTo-Money $goal.TargetAmount }
+    $gridRow.Cells["GoalDate"].Value = if ($isWeeklyGoal -and $goal.IsOngoing) { "Ongoing" } else { $goal.ExpectedDate.ToString("dd/MM/yy") }
     $script:DisplayedGoalIds += $goal.Id
   }
   if ($goalsList.Rows.Count -eq 0) {
@@ -1963,6 +2197,7 @@ function Refresh-All {
     Refresh-Breakdowns
     Refresh-Allocation
     Refresh-Grid
+    Update-LastRefreshedStatus
   } finally {
     if ($goalsList) { $goalsList.ResumeLayout() }
     if ($recurringPaymentsList) { $recurringPaymentsList.ResumeLayout() }
@@ -1971,6 +2206,18 @@ function Refresh-All {
     if ($grid) { $grid.ResumeLayout() }
     if ($form) { $form.ResumeLayout($true) }
   }
+}
+
+function Refresh-AppData {
+  Load-Entries
+  Reset-Form
+  $inputPanel.Visible = $false
+  Refresh-All
+}
+
+function Update-LastRefreshedStatus {
+  if (-not $lastRefreshLabel) { return }
+  $lastRefreshLabel.Text = "Last refreshed: $((Get-Date).ToString('dd/MM/yyyy h:mm tt'))"
 }
 
 function Save-FormEntry {
@@ -2134,10 +2381,13 @@ function Import-Backup {
   $dialog = New-Object System.Windows.Forms.OpenFileDialog
   $dialog.Filter = "JSON backup (*.json)|*.json"
   if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    $backupPath = New-AutoBackup "before-restore"
     Copy-Item -Path $dialog.FileName -Destination $DataPath -Force
     Load-Entries
     Reset-Form
     Refresh-All
+    $backupText = if ($backupPath) { " Auto-backup created first: $backupPath" } else { "" }
+    [System.Windows.Forms.MessageBox]::Show("Backup restored.$backupText", "Restore", "OK", "Information") | Out-Null
   }
 }
 
@@ -2148,7 +2398,7 @@ function Show-SavingsGoalDialog($existingGoal) {
   $dialog.FormBorderStyle = "FixedDialog"
   $dialog.MinimizeBox = $false
   $dialog.MaximizeBox = $false
-  $dialog.ClientSize = New-Object Drawing.Size(420, 330)
+  $dialog.ClientSize = New-Object Drawing.Size(420, 390)
 
   Add-Label $dialog "Goal Name" 16 14 120 | Out-Null
   $goalNameBox = New-Object System.Windows.Forms.TextBox
@@ -2164,44 +2414,64 @@ function Show-SavingsGoalDialog($existingGoal) {
   }
   $dialog.Controls.Add($goalAccountBox)
 
-  Add-Label $dialog "Target Amount" 16 76 120 | Out-Null
+  Add-Label $dialog "Plan" 16 76 120 | Out-Null
+  $goalKindBox = New-Object System.Windows.Forms.ComboBox
+  $goalKindBox.DropDownStyle = "DropDownList"
+  $goalKindBox.Items.AddRange(@("Target by date", "Weekly amount"))
+  $goalKindBox.SetBounds(16, 96, 180, 28)
+  $dialog.Controls.Add($goalKindBox)
+
+  Add-Label $dialog "Target Amount" 216 76 120 | Out-Null
   $targetBox = New-Object System.Windows.Forms.NumericUpDown
   $targetBox.DecimalPlaces = 2
   $targetBox.Maximum = 100000000
   $targetBox.ThousandsSeparator = $true
-  $targetBox.SetBounds(16, 96, 180, 28)
+  $targetBox.SetBounds(216, 96, 180, 28)
   $dialog.Controls.Add($targetBox)
 
-  Add-Label $dialog "Expected Date" 216 76 120 | Out-Null
+  Add-Label $dialog "Weekly Amount" 16 138 120 | Out-Null
+  $weeklyAmountBox = New-Object System.Windows.Forms.NumericUpDown
+  $weeklyAmountBox.DecimalPlaces = 2
+  $weeklyAmountBox.Maximum = 100000000
+  $weeklyAmountBox.ThousandsSeparator = $true
+  $weeklyAmountBox.SetBounds(16, 158, 180, 28)
+  $dialog.Controls.Add($weeklyAmountBox)
+
+  Add-Label $dialog "Expected / End Date" 216 138 140 | Out-Null
   $expectedPicker = New-Object System.Windows.Forms.DateTimePicker
   $expectedPicker.Format = "Short"
-  $expectedPicker.SetBounds(216, 96, 180, 28)
+  $expectedPicker.SetBounds(216, 158, 180, 28)
   $dialog.Controls.Add($expectedPicker)
 
-  Add-Label $dialog "Goal Type" 16 138 120 | Out-Null
+  $ongoingCheck = New-Object System.Windows.Forms.CheckBox
+  $ongoingCheck.Text = "Ongoing"
+  $ongoingCheck.SetBounds(216, 188, 100, 24)
+  $dialog.Controls.Add($ongoingCheck)
+
+  Add-Label $dialog "Goal Type" 16 210 120 | Out-Null
   $goalModeBox = New-Object System.Windows.Forms.ComboBox
   $goalModeBox.DropDownStyle = "DropDownList"
   $goalModeBox.Items.AddRange(@("Save", "Send"))
-  $goalModeBox.SetBounds(16, 158, 180, 28)
+  $goalModeBox.SetBounds(16, 230, 180, 28)
   $dialog.Controls.Add($goalModeBox)
 
-  Add-Label $dialog "Basic Info" 16 198 120 | Out-Null
+  Add-Label $dialog "Basic Info" 16 270 120 | Out-Null
   $goalNoteBox = New-Object System.Windows.Forms.TextBox
   $goalNoteBox.Multiline = $true
   $goalNoteBox.ScrollBars = "Vertical"
-  $goalNoteBox.SetBounds(16, 218, 380, 58)
+  $goalNoteBox.SetBounds(16, 290, 380, 48)
   $dialog.Controls.Add($goalNoteBox)
 
   $ok = New-Object System.Windows.Forms.Button
   $ok.Text = "Save"
   $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
-  $ok.SetBounds(216, 290, 82, 30)
+  $ok.SetBounds(216, 350, 82, 30)
   $dialog.AcceptButton = $ok
 
   $cancel = New-Object System.Windows.Forms.Button
   $cancel.Text = "Cancel"
   $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-  $cancel.SetBounds(314, 290, 82, 30)
+  $cancel.SetBounds(314, 350, 82, 30)
   $dialog.CancelButton = $cancel
   $dialog.Controls.AddRange(@($ok, $cancel))
 
@@ -2209,17 +2479,41 @@ function Show-SavingsGoalDialog($existingGoal) {
     $goalNameBox.Text = $existingGoal.Name
     $goalAccountBox.Text = $existingGoal.Account
     $targetBox.Value = [decimal]$existingGoal.TargetAmount
+    $weeklyAmountBox.Value = if ($existingGoal.WeeklyAmount) { [decimal]$existingGoal.WeeklyAmount } else { [decimal]0 }
     $expectedPicker.Value = [datetime]$existingGoal.ExpectedDate
     $goalModeBox.SelectedItem = if ($existingGoal.Mode) { [string]$existingGoal.Mode } else { "Save" }
+    $goalKindBox.SelectedItem = if ((Get-GoalKind $existingGoal) -eq "Weekly") { "Weekly amount" } else { "Target by date" }
+    $ongoingCheck.Checked = if ($existingGoal.IsOngoing) { [bool]$existingGoal.IsOngoing } else { $false }
     $goalNoteBox.Text = $existingGoal.Note
   } else {
     $expectedPicker.Value = [datetime]::Today.AddMonths(12)
     $goalModeBox.SelectedItem = "Save"
+    $goalKindBox.SelectedItem = "Target by date"
   }
+
+  $refreshGoalKindUi = {
+    $isWeekly = ([string]$goalKindBox.SelectedItem -eq "Weekly amount")
+    $targetBox.Enabled = -not $isWeekly
+    $weeklyAmountBox.Enabled = $isWeekly
+    $ongoingCheck.Enabled = $isWeekly
+    $expectedPicker.Enabled = (-not $isWeekly) -or (-not $ongoingCheck.Checked)
+  }
+  $goalKindBox.Add_SelectedIndexChanged($refreshGoalKindUi)
+  $ongoingCheck.Add_CheckedChanged($refreshGoalKindUi)
+  & $refreshGoalKindUi
 
   if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
   if ([string]::IsNullOrWhiteSpace($goalNameBox.Text) -or [string]::IsNullOrWhiteSpace($goalAccountBox.Text)) {
     [System.Windows.Forms.MessageBox]::Show("Please enter a goal name and account.", "Savings Goal", "OK", "Information") | Out-Null
+    return $null
+  }
+  $goalKind = if ([string]$goalKindBox.SelectedItem -eq "Weekly amount") { "Weekly" } else { "Target" }
+  if ($goalKind -eq "Target" -and [decimal]$targetBox.Value -le 0) {
+    [System.Windows.Forms.MessageBox]::Show("Enter a target amount.", "Savings Goal", "OK", "Information") | Out-Null
+    return $null
+  }
+  if ($goalKind -eq "Weekly" -and [decimal]$weeklyAmountBox.Value -le 0) {
+    [System.Windows.Forms.MessageBox]::Show("Enter a weekly amount.", "Savings Goal", "OK", "Information") | Out-Null
     return $null
   }
 
@@ -2227,9 +2521,12 @@ function Show-SavingsGoalDialog($existingGoal) {
     Id = if ($existingGoal) { $existingGoal.Id } else { New-EntryId }
     Name = $goalNameBox.Text.Trim()
     Account = $goalAccountBox.Text.Trim()
-    TargetAmount = [decimal]$targetBox.Value
+    TargetAmount = if ($goalKind -eq "Weekly") { [decimal]$weeklyAmountBox.Value } else { [decimal]$targetBox.Value }
     ExpectedDate = $expectedPicker.Value.Date
     Mode = [string]$goalModeBox.SelectedItem
+    GoalKind = $goalKind
+    WeeklyAmount = if ($goalKind -eq "Weekly") { [decimal]$weeklyAmountBox.Value } else { [decimal]0 }
+    IsOngoing = ($goalKind -eq "Weekly" -and $ongoingCheck.Checked)
     Note = $goalNoteBox.Text.Trim()
   }
 }
@@ -2476,6 +2773,118 @@ function Manage-AccountNames {
 
   $accountList.SelectedIndex = 0
   [void]$dialog.ShowDialog($form)
+}
+
+function Show-SettingsDialog {
+  $dialog = New-Object System.Windows.Forms.Form
+  $dialog.Text = "Settings"
+  $dialog.StartPosition = "CenterParent"
+  $dialog.FormBorderStyle = "FixedDialog"
+  $dialog.MinimizeBox = $false
+  $dialog.MaximizeBox = $false
+  $dialog.ClientSize = New-Object Drawing.Size(430, 260)
+
+  $graphModes = @("Savings Projection", "Monthly Flow", "Income vs Spend", "Savings Goals", "Balances", "Data Table")
+
+  Add-Label $dialog "Budget Week Starts" 16 16 160 | Out-Null
+  $weekStartBox = New-Object System.Windows.Forms.ComboBox
+  $weekStartBox.DropDownStyle = "DropDownList"
+  $weekStartBox.Items.AddRange(@("Monday", "Sunday"))
+  $weekStartBox.SetBounds(16, 38, 180, 28)
+  Set-InputStyle $weekStartBox
+  $dialog.Controls.Add($weekStartBox)
+
+  Add-Label $dialog "Currency" 226 16 160 | Out-Null
+  $currencyBox = New-Object System.Windows.Forms.ComboBox
+  $currencyBox.DropDownStyle = "DropDownList"
+  $currencyBox.Items.AddRange(@("AUD - Australia", "USD - United States", "GBP - United Kingdom", "EUR - Ireland"))
+  $currencyBox.SetBounds(226, 38, 180, 28)
+  Set-InputStyle $currencyBox
+  $dialog.Controls.Add($currencyBox)
+
+  Add-Label $dialog "Left Graph Default" 16 86 160 | Out-Null
+  $leftGraphBox = New-Object System.Windows.Forms.ComboBox
+  $leftGraphBox.DropDownStyle = "DropDownList"
+  $leftGraphBox.Items.AddRange($graphModes)
+  $leftGraphBox.SetBounds(16, 108, 180, 28)
+  Set-InputStyle $leftGraphBox
+  $dialog.Controls.Add($leftGraphBox)
+
+  Add-Label $dialog "Right Graph Default" 226 86 160 | Out-Null
+  $rightGraphBox = New-Object System.Windows.Forms.ComboBox
+  $rightGraphBox.DropDownStyle = "DropDownList"
+  $rightGraphBox.Items.AddRange($graphModes)
+  $rightGraphBox.SetBounds(226, 108, 180, 28)
+  Set-InputStyle $rightGraphBox
+  $dialog.Controls.Add($rightGraphBox)
+
+  $note = New-Object System.Windows.Forms.Label
+  $note.Text = "Settings are saved with your tracker data. Budget totals recalculate immediately after saving."
+  $note.SetBounds(16, 156, 390, 38)
+  $note.ForeColor = [Drawing.Color]::FromArgb(111, 98, 88)
+  $dialog.Controls.Add($note)
+
+  $ok = New-Object System.Windows.Forms.Button
+  $ok.Text = "Save"
+  $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $ok.SetBounds(226, 214, 82, 30)
+  Set-ButtonStyle $ok $true
+  $dialog.AcceptButton = $ok
+
+  $cancel = New-Object System.Windows.Forms.Button
+  $cancel.Text = "Cancel"
+  $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $cancel.SetBounds(324, 214, 82, 30)
+  Set-ButtonStyle $cancel
+  $dialog.CancelButton = $cancel
+  $dialog.Controls.AddRange(@($ok, $cancel))
+
+  $weekStartBox.SelectedItem = if ($script:Settings.WeekStartsOn) { [string]$script:Settings.WeekStartsOn } else { "Monday" }
+  $currencyBox.SelectedItem = switch ([string]$script:Settings.CurrencyCulture) {
+    "en-US" { "USD - United States" }
+    "en-GB" { "GBP - United Kingdom" }
+    "en-IE" { "EUR - Ireland" }
+    default { "AUD - Australia" }
+  }
+  $leftGraphBox.SelectedItem = if ($graphModes -contains [string]$script:Settings.LeftGraphDefault) { [string]$script:Settings.LeftGraphDefault } else { "Data Table" }
+  $rightGraphBox.SelectedItem = if ($graphModes -contains [string]$script:Settings.RightGraphDefault) { [string]$script:Settings.RightGraphDefault } else { "Income vs Spend" }
+
+  if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+  $script:Settings.WeekStartsOn = [string]$weekStartBox.SelectedItem
+  $script:Settings.CurrencyCulture = switch ([string]$currencyBox.SelectedItem) {
+    "USD - United States" { "en-US" }
+    "GBP - United Kingdom" { "en-GB" }
+    "EUR - Ireland" { "en-IE" }
+    default { "en-AU" }
+  }
+  $script:Settings.LeftGraphDefault = [string]$leftGraphBox.SelectedItem
+  $script:Settings.RightGraphDefault = [string]$rightGraphBox.SelectedItem
+
+  $graphModeCombo.SelectedItem = $script:Settings.LeftGraphDefault
+  $graphModeCombo2.SelectedItem = $script:Settings.RightGraphDefault
+  Save-Entries
+  Refresh-All
+}
+
+function Show-HelpDialog {
+  $message = @"
+Dashboard cards
+
+Remaining Budget = this week's paycheck minus minimum savings, expected bills, and spend.
+Bills = bill entries this week plus recurring payments due inside the budget week.
+Paycheck = income marked inside the current budget week.
+Min Savings = weekly saving needed for active goals.
+Spend = expense entries this week, excluding internal transfers.
+
+Tips
+
+Use Mark Income on your paycheck each week.
+Use Refresh after editing data or importing files.
+Bank statement imports report how many rows were added, skipped as duplicates, or skipped as zero-value rows.
+Automatic backups are created before imports and restores.
+"@
+  [System.Windows.Forms.MessageBox]::Show($message, "Expense & Savings Tracker Help", "OK", "Information") | Out-Null
 }
 
 function Get-HeaderName($row, [string[]]$candidates) {
@@ -2810,6 +3219,7 @@ function Import-BankStatement {
     return
   }
 
+  $backupPath = New-AutoBackup "statement-import"
   $added = 0
   $duplicatesSkipped = 0
   $zeroAmountSkipped = 0
@@ -2869,7 +3279,8 @@ function Import-BankStatement {
 
   Save-Entries
   Refresh-All
-  $summary = "Imported $added new transaction(s). Skipped $duplicatesSkipped duplicate(s) and $zeroAmountSkipped zero-value row(s). Debits were added as Expenses and credits as Savings. Bank Account, Narrative, Balance, Categories, and Serial are preserved where present."
+  $backupText = if ($backupPath) { "`n`nAuto-backup: $backupPath" } else { "" }
+  $summary = "Read $($rows.Count) row(s). Imported $added new transaction(s). Skipped $duplicatesSkipped duplicate(s) and $zeroAmountSkipped zero-value row(s). Debits were added as Expenses and credits as Savings. Bank Account, Narrative, Balance, Categories, and Serial are preserved where present.$backupText"
   [System.Windows.Forms.MessageBox]::Show($summary, "Import Bank Statement", "OK", "Information") | Out-Null
 }
 
@@ -2903,7 +3314,9 @@ function Import-AccountsCsv {
     return
   }
 
+  $backupPath = New-AutoBackup "accounts-import"
   $updated = 0
+  $skippedOlder = 0
   foreach ($row in $rows) {
     $accountId = Get-NormalizedAccountId $(if ($bsbHeader) { $row.$bsbHeader } else { "" }) $row.$accountHeader
     if ([string]::IsNullOrWhiteSpace($accountId)) { continue }
@@ -2913,6 +3326,7 @@ function Import-AccountsCsv {
     $source = [IO.Path]::GetFileName($dialog.FileName)
     $existingBalance = if ($script:AccountBalances.ContainsKey($accountId)) { $script:AccountBalances[$accountId] } else { $null }
     if ($existingBalance -and [datetime]$existingBalance.Date -gt $date) {
+      $skippedOlder++
       if ($nameHeader -and -not [string]::IsNullOrWhiteSpace([string]$row.$nameHeader)) {
         $script:AccountNames[$accountId] = ([string]$row.$nameHeader).Trim()
       } elseif ($typeHeader -and -not $script:AccountNames.ContainsKey($accountId)) {
@@ -2937,7 +3351,8 @@ function Import-AccountsCsv {
 
   Save-Entries
   Refresh-All
-  [System.Windows.Forms.MessageBox]::Show("Updated $updated account balance(s) and account name(s).", "Import Accounts CSV", "OK", "Information") | Out-Null
+  $backupText = if ($backupPath) { "`n`nAuto-backup: $backupPath" } else { "" }
+  [System.Windows.Forms.MessageBox]::Show("Read $($rows.Count) row(s). Updated $updated account balance(s) and account name(s). Skipped $skippedOlder older balance row(s).$backupText", "Import Accounts CSV", "OK", "Information") | Out-Null
 }
 
 function Add-Label($parent, [string]$text, [int]$x, [int]$y, [int]$w = 120) {
@@ -3053,6 +3468,10 @@ function Apply-MainLayout {
   $nameAccountsButton.SetBounds($exportButton.Left - $buttonGap - 116, $topButtonY, 116, 34)
   $importAccountsButton.SetBounds($nameAccountsButton.Left - $buttonGap - 116, $topButtonY, 116, 34)
   $importStatementButton.SetBounds($importAccountsButton.Left - $buttonGap - 116, $topButtonY, 116, 34)
+  $refreshButton.SetBounds($importStatementButton.Left - $buttonGap - 90, $topButtonY, 90, 34)
+  $settingsButton.SetBounds($refreshButton.Left - $buttonGap - 72, $topButtonY, 72, 34)
+  $helpButton.SetBounds($settingsButton.Left - $buttonGap - 58, $topButtonY, 58, 34)
+  $lastRefreshLabel.SetBounds($margin, 130, 360, 16)
 
   $inputPanel.SetBounds($margin, 146, 350, 500)
 
@@ -3070,6 +3489,14 @@ function Apply-MainLayout {
   $projectionSummaryLabel2.SetBounds($chart2X, 505, $chartWidth, 18)
   Set-ControlBounds $chart $contentX 166 $chartWidth 330
   Set-ControlBounds $chart2 $chart2X 166 $chartWidth 330
+  Set-ControlBounds $chartDataTable $contentX 166 $chartWidth 330
+  Set-ControlBounds $chartDataTable2 $chart2X 166 $chartWidth 330
+  $chartDataTable.Columns["BudgetItem"].Width = 120
+  $chartDataTable.Columns["BudgetAmount"].Width = 120
+  $chartDataTable.Columns["BudgetDetail"].Width = [math]::Max(220, $chartWidth - 244)
+  $chartDataTable2.Columns["BudgetItem"].Width = 110
+  $chartDataTable2.Columns["BudgetAmount"].Width = 110
+  $chartDataTable2.Columns["BudgetDetail"].Width = [math]::Max(180, $chartWidth - 224)
   $allocationTitleLabel.Visible = $false
   $allocationGrid.Visible = $false
   $allocationWarningLabel.Visible = $false
@@ -3158,7 +3585,7 @@ $form.BackColor = [Drawing.Color]::FromArgb(246, 240, 232)
 
 $title = New-Object System.Windows.Forms.Label
 $title.Text = "Expense & Savings Tracker"
-$title.SetBounds(18, 16, 430, 34)
+$title.SetBounds(18, 16, 280, 34)
 $title.Font = New-Object Drawing.Font("Segoe UI", 20, [Drawing.FontStyle]::Bold)
 $title.ForeColor = [Drawing.Color]::FromArgb(33, 26, 22)
 $title.Anchor = "Top,Left"
@@ -3168,6 +3595,18 @@ $importStatementButton = New-Object System.Windows.Forms.Button
 $importStatementButton.Text = "Import Statement"
 $importStatementButton.SetBounds(536, 18, 116, 34)
 $importStatementButton.Anchor = "Top,Left"
+$refreshButton = New-Object System.Windows.Forms.Button
+$refreshButton.Text = "Refresh"
+$refreshButton.SetBounds(438, 18, 90, 34)
+$refreshButton.Anchor = "Top,Left"
+$settingsButton = New-Object System.Windows.Forms.Button
+$settingsButton.Text = "Settings"
+$settingsButton.SetBounds(358, 18, 72, 34)
+$settingsButton.Anchor = "Top,Left"
+$helpButton = New-Object System.Windows.Forms.Button
+$helpButton.Text = "Help"
+$helpButton.SetBounds(292, 18, 58, 34)
+$helpButton.Anchor = "Top,Left"
 $importAccountsButton = New-Object System.Windows.Forms.Button
 $importAccountsButton.Text = "Import Accounts"
 $importAccountsButton.SetBounds(660, 18, 116, 34)
@@ -3188,14 +3627,21 @@ $restoreButton = New-Object System.Windows.Forms.Button
 $restoreButton.Text = "Restore"
 $restoreButton.SetBounds(1126, 18, 100, 34)
 $restoreButton.Anchor = "Top,Left"
-$form.Controls.AddRange(@($importStatementButton, $importAccountsButton, $nameAccountsButton, $exportButton, $backupButton, $restoreButton))
-foreach ($button in @($importStatementButton, $importAccountsButton, $nameAccountsButton, $exportButton, $backupButton, $restoreButton)) { Set-ButtonStyle $button }
+$form.Controls.AddRange(@($helpButton, $settingsButton, $refreshButton, $importStatementButton, $importAccountsButton, $nameAccountsButton, $exportButton, $backupButton, $restoreButton))
+foreach ($button in @($helpButton, $settingsButton, $refreshButton, $importStatementButton, $importAccountsButton, $nameAccountsButton, $exportButton, $backupButton, $restoreButton)) { Set-ButtonStyle $button }
+
+$lastRefreshLabel = New-Object System.Windows.Forms.Label
+$lastRefreshLabel.Text = "Last refreshed: --"
+$lastRefreshLabel.SetBounds(18, 130, 360, 16)
+$lastRefreshLabel.ForeColor = [Drawing.Color]::FromArgb(111, 98, 88)
+$lastRefreshLabel.Font = New-Object Drawing.Font("Segoe UI", 8)
+$form.Controls.Add($lastRefreshLabel)
 
 $remainingBudgetValue = Add-Metric $form "REMAINING BUDGET" 18
 $billValue = Add-Metric $form "BILLS" 204
-$progressValue = Add-Metric $form "GOAL PROGRESS" 390
-$savedBalanceValue = Add-Metric $form "SAVINGS BALANCE" 576
-$minimumWeeklyValue = Add-Metric $form "MIN WEEKLY SAVE" 762
+$progressValue = Add-Metric $form "PAYCHECK" 390
+$savedBalanceValue = Add-Metric $form "MIN SAVINGS" 576
+$minimumWeeklyValue = Add-Metric $form "SPEND" 762
 
 $inputPanel = New-Object System.Windows.Forms.Panel
 $inputPanel.SetBounds(18, 146, 350, 500)
@@ -3276,7 +3722,7 @@ Set-ButtonStyle $clearButton
 $chartTitleLabel = Add-SectionTitle $form "Monthly Flow" 386 142 220
 $graphModeCombo = New-Object System.Windows.Forms.ComboBox
 $graphModeCombo.DropDownStyle = "DropDownList"
-$graphModeCombo.Items.AddRange(@("Savings Projection", "Monthly Flow", "Income vs Spend", "Savings Goals", "Balances"))
+$graphModeCombo.Items.AddRange(@("Savings Projection", "Monthly Flow", "Income vs Spend", "Savings Goals", "Balances", "Data Table"))
 $graphModeCombo.SetBounds(596, 138, 190, 30)
 Set-InputStyle $graphModeCombo
 $form.Controls.Add($graphModeCombo)
@@ -3284,7 +3730,7 @@ $form.Controls.Add($graphModeCombo)
 $chartTitleLabel2 = Add-SectionTitle $form "Income vs Spend" 820 142 220
 $graphModeCombo2 = New-Object System.Windows.Forms.ComboBox
 $graphModeCombo2.DropDownStyle = "DropDownList"
-$graphModeCombo2.Items.AddRange(@("Savings Projection", "Monthly Flow", "Income vs Spend", "Savings Goals", "Balances"))
+$graphModeCombo2.Items.AddRange(@("Savings Projection", "Monthly Flow", "Income vs Spend", "Savings Goals", "Balances", "Data Table"))
 $graphModeCombo2.SetBounds(1030, 138, 190, 30)
 Set-InputStyle $graphModeCombo2
 $form.Controls.Add($graphModeCombo2)
@@ -3294,6 +3740,7 @@ $projectionSummaryLabel.SetBounds(666, 142, 560, 22)
 $projectionSummaryLabel.TextAlign = [Drawing.ContentAlignment]::MiddleRight
 $projectionSummaryLabel.ForeColor = [Drawing.Color]::FromArgb(79, 68, 58)
 $projectionSummaryLabel.Font = New-Object Drawing.Font("Segoe UI", 8, [Drawing.FontStyle]::Bold)
+$projectionSummaryLabel.Visible = $false
 $form.Controls.Add($projectionSummaryLabel)
 
 $projectionSummaryLabel2 = New-Object System.Windows.Forms.Label
@@ -3301,6 +3748,7 @@ $projectionSummaryLabel2.SetBounds(1030, 142, 560, 22)
 $projectionSummaryLabel2.TextAlign = [Drawing.ContentAlignment]::MiddleRight
 $projectionSummaryLabel2.ForeColor = [Drawing.Color]::FromArgb(79, 68, 58)
 $projectionSummaryLabel2.Font = New-Object Drawing.Font("Segoe UI", 8, [Drawing.FontStyle]::Bold)
+$projectionSummaryLabel2.Visible = $false
 $form.Controls.Add($projectionSummaryLabel2)
 
 $chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
@@ -3332,6 +3780,22 @@ $legend.Font = New-Object Drawing.Font("Segoe UI", 8)
 $chart.Legends.Add($legend)
 $form.Controls.Add($chart)
 
+$chartDataTable = New-Object System.Windows.Forms.DataGridView
+$chartDataTable.SetBounds(386, 166, 840, 248)
+Set-DashboardGridStyle $chartDataTable @(
+  @("BudgetItem", "Item"),
+  @("BudgetAmount", "Amount"),
+  @("BudgetDetail", "Detail")
+)
+$chartDataTable.ColumnHeadersVisible = $true
+$chartDataTable.EnableHeadersVisualStyles = $false
+$chartDataTable.ColumnHeadersDefaultCellStyle.BackColor = [Drawing.Color]::FromArgb(241, 229, 216)
+$chartDataTable.ColumnHeadersDefaultCellStyle.ForeColor = [Drawing.Color]::FromArgb(33, 26, 22)
+$chartDataTable.ColumnHeadersDefaultCellStyle.Font = New-Object Drawing.Font("Segoe UI", 8, [Drawing.FontStyle]::Bold)
+$chartDataTable.Columns["BudgetAmount"].DefaultCellStyle.Alignment = [System.Windows.Forms.DataGridViewContentAlignment]::MiddleRight
+$chartDataTable.Visible = $false
+$form.Controls.Add($chartDataTable)
+
 $chart2 = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
 $chart2.SetBounds(820, 166, 400, 330)
 $chart2.BackColor = [Drawing.Color]::White
@@ -3360,6 +3824,22 @@ $legend2.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Ri
 $legend2.Font = New-Object Drawing.Font("Segoe UI", 8)
 $chart2.Legends.Add($legend2)
 $form.Controls.Add($chart2)
+
+$chartDataTable2 = New-Object System.Windows.Forms.DataGridView
+$chartDataTable2.SetBounds(820, 166, 400, 330)
+Set-DashboardGridStyle $chartDataTable2 @(
+  @("BudgetItem", "Item"),
+  @("BudgetAmount", "Amount"),
+  @("BudgetDetail", "Detail")
+)
+$chartDataTable2.ColumnHeadersVisible = $true
+$chartDataTable2.EnableHeadersVisualStyles = $false
+$chartDataTable2.ColumnHeadersDefaultCellStyle.BackColor = [Drawing.Color]::FromArgb(241, 229, 216)
+$chartDataTable2.ColumnHeadersDefaultCellStyle.ForeColor = [Drawing.Color]::FromArgb(33, 26, 22)
+$chartDataTable2.ColumnHeadersDefaultCellStyle.Font = New-Object Drawing.Font("Segoe UI", 8, [Drawing.FontStyle]::Bold)
+$chartDataTable2.Columns["BudgetAmount"].DefaultCellStyle.Alignment = [System.Windows.Forms.DataGridViewContentAlignment]::MiddleRight
+$chartDataTable2.Visible = $false
+$form.Controls.Add($chartDataTable2)
 
 $allocationTitleLabel = Add-SectionTitle $form "Weekly Savings Allocation" 386 382 240
 
@@ -3679,14 +4159,17 @@ $recurringPaymentsList.Add_KeyDown({
 $importStatementButton.Add_Click({ Import-BankStatement })
 $importAccountsButton.Add_Click({ Import-AccountsCsv })
 $nameAccountsButton.Add_Click({ Manage-AccountNames })
+$refreshButton.Add_Click({ Refresh-AppData })
+$settingsButton.Add_Click({ Show-SettingsDialog })
+$helpButton.Add_Click({ Show-HelpDialog })
 $exportButton.Add_Click({ Export-Csv })
 $backupButton.Add_Click({ Export-Backup })
 $restoreButton.Add_Click({ Import-Backup })
 
 $viewCombo.SelectedItem = "All"
 $sortCombo.SelectedItem = "Newest first"
-$graphModeCombo.SelectedItem = "Savings Projection"
-$graphModeCombo2.SelectedItem = "Income vs Spend"
+$graphModeCombo.SelectedItem = if ($graphModeCombo.Items.Contains([string]$script:Settings.LeftGraphDefault)) { [string]$script:Settings.LeftGraphDefault } else { "Data Table" }
+$graphModeCombo2.SelectedItem = if ($graphModeCombo2.Items.Contains([string]$script:Settings.RightGraphDefault)) { [string]$script:Settings.RightGraphDefault } else { "Income vs Spend" }
 Reset-Form
 Refresh-All
 Apply-MainLayout
