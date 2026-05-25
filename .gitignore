@@ -1,0 +1,7 @@
+tracker-data/
+*.log
+*.tmp
+*.bak
+outputs/
+spreadsheet_work/
+__pycache__/
