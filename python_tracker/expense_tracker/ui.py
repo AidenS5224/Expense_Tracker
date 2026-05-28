@@ -1058,7 +1058,7 @@ class TrackerApp(tk.Tk):
             "Use Mark Income or edit an entry to set your paycheck as Income.\n\n"
             "Remaining Budget = paycheck plus other income minus minimum savings, expected bills, debts, and spend.\n"
             "Bills = bill entries this week plus recurring payments due inside the week.\n"
-            "The Python version is still being matched to the original app, so keep testing against the PowerShell version for now.",
+            "Use Import Statement and Import Accounts to keep transactions and balances current.",
         )
 
     def show_settings(self) -> None:
@@ -1115,12 +1115,12 @@ class TrackerApp(tk.Tk):
         messagebox.showinfo("Restore", "Restore complete.")
 
     def sync_legacy_data(self) -> None:
-        if not messagebox.askyesno("Sync Data", "Replace the Python database with the current PowerShell tracker data?"):
+        if not messagebox.askyesno("Sync Data", "Replace the Python database with the current legacy tracker data?"):
             return
         try:
             self.store.replace_from_legacy_json()
             self.refresh()
-            messagebox.showinfo("Sync Data", "Python database synced from the current PowerShell tracker data.")
+            messagebox.showinfo("Sync Data", "Python database synced from the current legacy tracker data.")
         except Exception as exc:
             messagebox.showerror("Sync Data", str(exc))
 

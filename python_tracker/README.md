@@ -1,6 +1,6 @@
 # Expense & Savings Tracker - Python
 
-Native Python rebuild of the PowerShell Expense & Savings Tracker.
+Native Python desktop app for tracking expenses, savings goals, recurring payments, account balances, and weekly budget planning.
 
 ## Requirements
 
@@ -37,18 +37,18 @@ The app stores data in:
 data/tracker.sqlite3
 ```
 
-On first launch, it will migrate the existing PowerShell JSON data from:
+On first launch, it can migrate existing legacy JSON data from:
 
 ```text
 ../tracker-data/data.json
 ```
 
-The PowerShell app is not modified.
+The legacy data file is not modified.
 
 ## Features In This Build
 
 - SQLite data store
-- JSON migration from the PowerShell tracker
+- JSON migration from the legacy tracker data file
 - Statement CSV import with duplicate detection
 - Accounts CSV import
 - Current balances using account balance anchors plus later transactions

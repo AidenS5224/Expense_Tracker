@@ -184,7 +184,7 @@ class TrackerStore:
     def replace_from_legacy_json(self, path: Path | None = None) -> None:
         path = path or self.legacy_json
         if not path or not path.exists():
-            raise FileNotFoundError("PowerShell tracker data.json was not found.")
+            raise FileNotFoundError("Legacy tracker data.json was not found.")
         with self.session() as con:
             for table in (
                 "entries",

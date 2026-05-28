@@ -1,6 +1,6 @@
-# Expense & Savings Tracker
+# Expense Savings Tracker
 
-A Windows desktop expense and savings tracker built with PowerShell WinForms.
+A Windows desktop expense and savings tracker rebuilt as a native Python app.
 
 ## Features
 
@@ -15,10 +15,17 @@ A Windows desktop expense and savings tracker built with PowerShell WinForms.
 
 ## Run
 
-Double-click `Start-ExpenseTracker.cmd`, or run:
+Double-click:
+
+```text
+python_tracker\Start-Python-ExpenseTracker.cmd
+```
+
+Or run directly:
 
 ```powershell
-powershell.exe -STA -NoProfile -ExecutionPolicy Bypass -File ".\ExpenseSavingsTracker.ps1"
+cd python_tracker
+py -3 -m expense_tracker
 ```
 
 ## Basic Use
@@ -31,10 +38,9 @@ powershell.exe -STA -NoProfile -ExecutionPolicy Bypass -File ".\ExpenseSavingsTr
 
 ## Data
 
-Local app data is saved in `tracker-data/data.json`.
-Automatic backups are saved in `tracker-data/backups/`.
+Local app data is saved in `python_tracker\data\tracker.sqlite3`.
+The local database is ignored by Git and should not be uploaded.
 
 ## Privacy
 
-Bank transactions and account balances stay local in `tracker-data/`.
-That folder is ignored by Git and should not be uploaded.
+Bank transactions and account balances stay local on your machine.
