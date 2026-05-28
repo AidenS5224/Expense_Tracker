@@ -1,0 +1,9 @@
+[project]
+name = "expense-savings-tracker"
+version = "0.1.0"
+description = "Native Python desktop app for expenses, balances, recurring payments, and savings projections."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -27,6 +27,11 @@ $script:AccountFilterMap = @{}
 $script:EntryAccountMap = @{}
 $script:DisplayedBalanceAccounts = @()
 $script:EditingId = $null
+$script:CalculatedAccountBalancesCache = $null
+$script:GoalProgressRowsCache = $null
+$script:ProjectionSummaryCache = $null
+$script:PaycheckDistributionCache = $null
+$script:MinimumSavingsProjectionCache = $null
 $NewAccountOption = "New account..."
 
 function Reset-AppSettings {
@@ -39,6 +44,14 @@ function Reset-AppSettings {
 }
 
 Reset-AppSettings
+
+function Clear-ComputedCaches {
+  $script:CalculatedAccountBalancesCache = $null
+  $script:GoalProgressRowsCache = $null
+  $script:ProjectionSummaryCache = $null
+  $script:PaycheckDistributionCache = $null
+  $script:MinimumSavingsProjectionCache = $null
+}
 
 $Categories = @{
   Expense = @("Rent / Mortgage", "Utilities", "Groceries", "Transport", "Insurance", "Medical", "Subscriptions", "Dining", "Personal", "Entertainment", "Debt", "Other")
@@ -164,6 +177,39 @@ function Test-GoalSavingEntry($entry) {
   return $false
 }
 
+function Get-ActualSavingsAmount($items, [string]$selectedAccount = "All Accounts") {
+  $goalAccounts = @{}
+  foreach ($goal in @($script:Goals)) {
+    $account = [string]$goal.Account
+    if (-not [string]::IsNullOrWhiteSpace($account)) {
+      $goalAccounts[$account] = $true
+    }
+  }
+
+  $total = [decimal]0
+  foreach ($entry in @($items)) {
+    if (-not $entry) { continue }
+    $account = [string]$entry.Account
+
+    $isRelevantAccount = if ($selectedAccount -and $selectedAccount -ne "All Accounts") {
+      $account -eq $selectedAccount
+    } else {
+      $goalAccounts.ContainsKey($account)
+    }
+
+    if ($isRelevantAccount -and (Test-SavingsAccountCredit $entry)) {
+      $total += [decimal]$entry.Amount
+      continue
+    }
+
+    if (-not $isRelevantAccount -and (Test-GoalSavingEntry $entry)) {
+      $total += [decimal]$entry.Amount
+    }
+  }
+
+  return $total
+}
+
 function Get-AllKnownAccounts {
   $accounts = @(
     $script:Entries | ForEach-Object { $_.Account }
@@ -212,6 +258,7 @@ function Get-LatestStatementBalances {
 }
 
 function Get-CalculatedAccountBalances {
+  if ($script:CalculatedAccountBalancesCache) { return @($script:CalculatedAccountBalancesCache) }
   $statementBalances = Get-LatestStatementBalances
   $accountRows = New-Object System.Collections.ArrayList
   $allAccounts = @(
@@ -265,7 +312,9 @@ function Get-CalculatedAccountBalances {
     }
   }
 
-  return @($accountRows | Sort-Object Account)
+  $result = @($accountRows | Sort-Object Account)
+  $script:CalculatedAccountBalancesCache = $result
+  return @($result)
 }
 
 function Get-EntryBalanceDelta($entry) {
@@ -414,6 +463,7 @@ function Get-GoalSavedAmount($goal, $calculatedBalances = $null) {
 }
 
 function Get-GoalProgressRows {
+  if ($script:GoalProgressRowsCache) { return @($script:GoalProgressRowsCache) }
   $calculatedBalances = Get-CalculatedAccountBalances
   $availableByAccount = @{}
   foreach ($row in $calculatedBalances) {
@@ -442,7 +492,9 @@ function Get-GoalProgressRows {
     })
   }
 
-  return @($rows)
+  $result = @($rows)
+  $script:GoalProgressRowsCache = $result
+  return @($result)
 }
 
 function Get-GoalStatus([decimal]$remaining, [decimal]$requiredWeekly, [decimal]$projectedWeekly, [double]$weeksRemaining) {
@@ -453,87 +505,175 @@ function Get-GoalStatus([decimal]$remaining, [decimal]$requiredWeekly, [decimal]
   return "Behind"
 }
 
+function Get-GoalPriorityWeight($goal, [double]$weeksRemaining) {
+  $weight = [decimal]1
+  $name = if ($goal -and $goal.Name) { ([string]$goal.Name).ToLowerInvariant() } else { "" }
+  $mode = if ($goal -and $goal.Mode) { [string]$goal.Mode } else { "Save" }
+
+  if ($name -match "emergency|buffer|urgent") { $weight *= [decimal]1.25 }
+  if ($mode -eq "Send") { $weight *= [decimal]1.15 }
+
+  $urgency = [decimal](1 + (1 / [math]::Max(2, $weeksRemaining + 1)))
+  return $weight * $urgency
+}
+
+function Add-AllocationAmount([hashtable]$allocations, [string]$goalId, [decimal]$amount) {
+  if ($amount -le 0) { return }
+  $current = if ($allocations.ContainsKey($goalId)) { [decimal]$allocations[$goalId] } else { [decimal]0 }
+  $allocations[$goalId] = $current + $amount
+}
+
+function Add-WeightedAllocation([object[]]$rows, [hashtable]$allocations, [decimal]$amount) {
+  $remainingBudget = [math]::Max([decimal]0, $amount)
+  while ($remainingBudget -gt [decimal]0.0001) {
+    $candidates = @($rows | Where-Object {
+      $goalId = [string]$_.Goal.Id
+      $current = if ($allocations.ContainsKey($goalId)) { [decimal]$allocations[$goalId] } else { [decimal]0 }
+      ([decimal]$_.Remaining - $current) -gt [decimal]0.0001
+    })
+    if ($candidates.Count -eq 0) { break }
+
+    $totalScore = [decimal](@($candidates | Measure-Object PriorityScore -Sum).Sum)
+    if ($totalScore -le 0) { $totalScore = [decimal]$candidates.Count }
+    $usedThisPass = [decimal]0
+
+    foreach ($row in $candidates) {
+      if ($remainingBudget -le 0) { break }
+      $goalId = [string]$row.Goal.Id
+      $current = if ($allocations.ContainsKey($goalId)) { [decimal]$allocations[$goalId] } else { [decimal]0 }
+      $room = [math]::Max([decimal]0, [decimal]$row.Remaining - $current)
+      if ($room -le 0) { continue }
+      $share = $remainingBudget * ([decimal]$row.PriorityScore / $totalScore)
+      if ($share -le 0) { $share = $remainingBudget / [decimal]$candidates.Count }
+      $extra = [math]::Min($room, $share)
+      Add-AllocationAmount $allocations $goalId $extra
+      $usedThisPass += $extra
+    }
+
+    if ($usedThisPass -le [decimal]0.0001) { break }
+    $remainingBudget -= $usedThisPass
+  }
+}
+
+function Get-SmoothedTargetAllocations([object[]]$targetRows, [decimal]$weeklyTarget, [datetime]$effectiveDate) {
+  $allocations = @{}
+  $budget = [math]::Max([decimal]0, $weeklyTarget)
+  $activeRows = @($targetRows | Where-Object { [decimal]$_.Remaining -gt 0 })
+  if ($activeRows.Count -eq 0 -or $budget -le 0) {
+    return $allocations
+  }
+
+  $scoreRows = @($activeRows | ForEach-Object {
+    $goal = $_.Goal
+    $daysRemaining = [math]::Max(1, (([datetime]$goal.ExpectedDate - $effectiveDate).TotalDays))
+    $weeksRemaining = [math]::Max([double]1, [math]::Floor($daysRemaining / 7))
+    $requiredWeekly = [decimal]$_.Remaining / [decimal]$weeksRemaining
+    $priorityWeight = Get-GoalPriorityWeight $goal $weeksRemaining
+    [pscustomobject]@{
+      Goal = $goal
+      Remaining = [decimal]$_.Remaining
+      WeeksRemaining = $weeksRemaining
+      RequiredWeekly = $requiredWeekly
+      PriorityScore = [math]::Max([decimal]0.0001, $requiredWeekly * $priorityWeight)
+    }
+  })
+
+  $reserved = [decimal]0
+  $dueDates = @($scoreRows | ForEach-Object { ([datetime]$_.Goal.ExpectedDate).Date } | Sort-Object -Unique)
+  foreach ($dueDate in $dueDates) {
+    $prefixRows = @($scoreRows | Where-Object { ([datetime]$_.Goal.ExpectedDate).Date -le $dueDate })
+    $daysRemaining = [math]::Max(1, (($dueDate - $effectiveDate.Date).TotalDays))
+    $weeksRemaining = [math]::Max([double]1, [math]::Floor($daysRemaining / 7))
+    $allowedAfterThisWeek = [decimal]$weeklyTarget * [decimal]([math]::Max(0, $weeksRemaining - 1))
+    $prefixRemainingAfter = [decimal]0
+    foreach ($row in $prefixRows) {
+      $goalId = [string]$row.Goal.Id
+      $allocated = if ($allocations.ContainsKey($goalId)) { [decimal]$allocations[$goalId] } else { [decimal]0 }
+      $prefixRemainingAfter += [math]::Max([decimal]0, [decimal]$row.Remaining - $allocated)
+    }
+
+    $deficit = $prefixRemainingAfter - $allowedAfterThisWeek
+    if ($deficit -gt [decimal]0.0001) {
+      $roomInWeek = [math]::Max([decimal]0, $budget - $reserved)
+      $reserveAmount = [math]::Min($deficit, $roomInWeek)
+      Add-WeightedAllocation $prefixRows $allocations $reserveAmount
+      $reserved += $reserveAmount
+    }
+  }
+
+  $currentTotal = [decimal](@($allocations.Values | Measure-Object -Sum).Sum)
+  $remainingSmoothBudget = [math]::Max([decimal]0, $budget - $currentTotal)
+  Add-WeightedAllocation $scoreRows $allocations $remainingSmoothBudget
+
+  return $allocations
+}
+
 function Get-AllocationPlan([decimal]$weeklyAvailableSavings, [hashtable]$previousAllocations = $null, [Nullable[datetime]]$asOfDate = $null, [object[]]$goalRows = $null) {
   if (-not $previousAllocations) { $previousAllocations = $script:AllocationHistory }
   $effectiveDate = if ($asOfDate.HasValue) { $asOfDate.Value } else { [datetime]::Today }
   if (-not $goalRows) { $goalRows = Get-GoalProgressRows }
 
-  $activeRows = @($goalRows | Where-Object { [decimal]$_.Remaining -gt 0 })
+  $targetRows = @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -ne "Weekly" -and [decimal]$_.Remaining -gt 0 })
+  $weeklyRows = @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -eq "Weekly" -and (Test-WeeklyGoalActive $_.Goal $effectiveDate) -and (Get-GoalWeeklyAmount $_.Goal) -gt 0 })
+  $minimumPlan = Get-MinimumWeeklySavingsPlan -asOfDate $effectiveDate -goalRows $goalRows
   $allocations = @{}
   $details = New-Object System.Collections.ArrayList
   $remainingBudget = [math]::Max([decimal]0, $weeklyAvailableSavings)
-  if ($activeRows.Count -eq 0 -or $remainingBudget -le 0) {
+
+  if ($targetRows.Count -eq 0 -and $weeklyRows.Count -eq 0) {
     return [pscustomobject]@{ Rows = @(); TotalAllocated = [decimal]0; Leftover = $remainingBudget; Warning = "" }
   }
 
-  $scoreRows = New-Object System.Collections.ArrayList
-  foreach ($row in $activeRows) {
-    $goal = $row.Goal
-    $remaining = [decimal]$row.Remaining
-    $target = [math]::Max([decimal]1, [decimal]$goal.TargetAmount)
-    $daysRemaining = [math]::Max(1, (([datetime]$goal.ExpectedDate - $effectiveDate).TotalDays))
-    $weeksRemaining = [math]::Max([double]1, [double]($daysRemaining / 7))
-    $requiredWeekly = $remaining / [decimal]$weeksRemaining
-    $urgencyWeight = [decimal](1 / $weeksRemaining)
-    $shortfallWeight = [decimal]1 + ($remaining / $target)
-    $riskWeight = [decimal]1 + ($requiredWeekly / [math]::Max([decimal]1, $weeklyAvailableSavings))
-    $priorityScore = $urgencyWeight * $shortfallWeight * $riskWeight
-    [void]$scoreRows.Add([pscustomobject]@{
-      Goal = $goal
-      Remaining = $remaining
-      WeeksRemaining = $weeksRemaining
-      RequiredWeekly = $requiredWeekly
-      PriorityScore = $priorityScore
-    })
-  }
-
-  $totalPriority = [decimal](@($scoreRows | Measure-Object PriorityScore -Sum).Sum)
-  foreach ($row in $scoreRows) {
-    $goal = $row.Goal
-    $previous = if ($previousAllocations.ContainsKey($goal.Id)) { [decimal]$previousAllocations[$goal.Id] } else { [decimal]0 }
-    $raw = if ($totalPriority -gt 0) { $weeklyAvailableSavings * ([decimal]$row.PriorityScore / $totalPriority) } else { [decimal]0 }
-    $smoothed = if ($previous -gt 0) { ([decimal]0.7 * $previous) + ([decimal]0.3 * $raw) } else { $raw }
-    if ($previous -gt 0) {
-      $smoothed = [math]::Min($previous * [decimal]1.15, [math]::Max($previous * [decimal]0.85, $smoothed))
-    }
-    $allocated = [math]::Min([decimal]$row.Remaining, [math]::Min($remainingBudget, $smoothed))
-    $allocations[$goal.Id] = [decimal]$allocated
-    $remainingBudget -= [decimal]$allocated
-  }
-
-  foreach ($row in @($scoreRows | Sort-Object { $_.Goal.ExpectedDate })) {
+  foreach ($row in $weeklyRows) {
     if ($remainingBudget -le 0) { break }
     $goal = $row.Goal
-    $currentAllocation = if ($allocations.ContainsKey($goal.Id)) { [decimal]$allocations[$goal.Id] } else { [decimal]0 }
-    $room = [math]::Max([decimal]0, [decimal]$row.Remaining - $currentAllocation)
-    if ($room -le 0) { continue }
-    $extra = [math]::Min($room, $remainingBudget)
-    $allocations[$goal.Id] = $currentAllocation + $extra
-    $remainingBudget -= $extra
+    $allocation = [math]::Min($remainingBudget, (Get-GoalWeeklyAmount $goal))
+    Add-AllocationAmount $allocations ([string]$goal.Id) $allocation
+    $remainingBudget -= $allocation
   }
 
+  if ($remainingBudget -gt 0 -and $targetRows.Count -gt 0) {
+    $targetPlan = Get-MinimumWeeklySavingsPlan -asOfDate $effectiveDate -goalRows $targetRows
+    $targetBudget = [math]::Min($remainingBudget, [decimal]$targetPlan.MinimumWeeklyRate)
+    $targetAllocations = Get-SmoothedTargetAllocations $targetRows $targetBudget $effectiveDate
+    foreach ($key in $targetAllocations.Keys) {
+      Add-AllocationAmount $allocations ([string]$key) ([decimal]$targetAllocations[$key])
+    }
+    $remainingBudget -= [decimal](@($targetAllocations.Values | Measure-Object -Sum).Sum)
+  }
+
+  $allRows = @($weeklyRows + $targetRows)
   $totalAllocated = [decimal]0
-  foreach ($row in $scoreRows) {
+  foreach ($row in $allRows) {
     $goal = $row.Goal
     $allocation = if ($allocations.ContainsKey($goal.Id)) { [decimal]$allocations[$goal.Id] } else { [decimal]0 }
     $totalAllocated += $allocation
-    $weeksToComplete = if ($allocation -gt 0) { [math]::Ceiling(([decimal]$row.Remaining / $allocation)) } else { [double]::PositiveInfinity }
-    $completionDate = if ($allocation -gt 0) { $effectiveDate.AddDays([double]$weeksToComplete * 7) } else { [datetime]$goal.ExpectedDate }
-    $status = Get-GoalStatus ([decimal]$row.Remaining) ([decimal]$row.RequiredWeekly) $allocation ([double]$row.WeeksRemaining)
+    $isWeekly = (Get-GoalKind $goal) -eq "Weekly"
+    $targetDate = if ($isWeekly -and $goal.IsOngoing) { [datetime]::MaxValue } else { [datetime]$goal.ExpectedDate }
+    $remaining = if ($isWeekly) { Get-GoalWeeklyAmount $goal } else { [decimal]$row.Remaining }
+    $daysRemaining = if ($isWeekly -and $goal.IsOngoing) { 7 } else { [math]::Max(1, (($targetDate - $effectiveDate).TotalDays)) }
+    $weeksRemaining = [math]::Max([double]1, [math]::Floor($daysRemaining / 7))
+    $requiredWeekly = if ($isWeekly) { Get-GoalWeeklyAmount $goal } else { $remaining / [decimal]$weeksRemaining }
+    $weeksToComplete = if ($allocation -gt 0 -and -not $isWeekly) { [math]::Ceiling($remaining / $allocation) } else { 1 }
+    $completionDate = if ($isWeekly) { $targetDate } elseif ($allocation -gt 0) { $effectiveDate.AddDays([double]$weeksToComplete * 7) } else { $targetDate }
+    $status = if ($isWeekly) {
+      if ($allocation -ge $requiredWeekly) { "On Track" } elseif ($weeklyAvailableSavings -lt [decimal]$minimumPlan.MinimumWeeklyRate) { "Behind" } else { "Impossible" }
+    } else {
+      Get-GoalStatus $remaining $requiredWeekly $allocation $weeksRemaining
+    }
     [void]$details.Add([pscustomobject]@{
       GoalId = $goal.Id
       GoalName = $goal.Name
-      TargetDate = [datetime]$goal.ExpectedDate
-      Remaining = [decimal]$row.Remaining
-      RequiredWeekly = [decimal]$row.RequiredWeekly
+      TargetDate = $targetDate
+      Remaining = [decimal]$remaining
+      RequiredWeekly = [decimal]$requiredWeekly
       Allocation = [decimal]$allocation
       ProjectedCompletion = $completionDate
       Status = $status
     })
   }
 
-  $requiredTotal = [decimal](@($scoreRows | Measure-Object RequiredWeekly -Sum).Sum)
-  $warning = if ($weeklyAvailableSavings -lt $requiredTotal) { "Warning: weekly savings is too low to hit all deadlines" } else { "" }
+  $warning = if ($weeklyAvailableSavings -lt [decimal]$minimumPlan.MinimumWeeklyRate) { "Warning: weekly savings is too low to hit all deadlines" } else { "" }
   return [pscustomobject]@{
     Rows = @($details | Sort-Object TargetDate)
     TotalAllocated = $totalAllocated
@@ -715,6 +855,7 @@ function Test-RecurringPaymentDueInRange($payment, [datetime]$rangeStart, [datet
 }
 
 function Get-ProjectionSummary {
+  if ($script:ProjectionSummaryCache) { return $script:ProjectionSummaryCache }
   $today = [datetime]::Today
   $recentStart = $today.AddDays(-90)
   $currentPaycheck = Get-CurrentPaycheck
@@ -745,19 +886,9 @@ function Get-ProjectionSummary {
     $recurringWeekly += ConvertTo-WeeklyAmount ([decimal]$payment.Amount) ([string]$payment.Frequency)
   }
 
-  $requiredWeekly = [decimal]0
-  foreach ($row in Get-GoalProgressRows) {
-    $goal = $row.Goal
-    if ((Get-GoalKind $goal) -eq "Weekly") {
-      if (Test-WeeklyGoalActive $goal $today) { $requiredWeekly += Get-GoalWeeklyAmount $goal }
-      continue
-    }
-    $remaining = [decimal]$row.Remaining
-    $daysLeft = [math]::Max(1, (([datetime]$goal.ExpectedDate - $today).TotalDays))
-    $requiredWeekly += $remaining / ([decimal]$daysLeft / 7)
-  }
+  $requiredWeekly = [decimal](Get-MinimumWeeklySavingsPlan -asOfDate $today).MinimumWeeklyRate
 
-  return [pscustomobject]@{
+  $result = [pscustomobject]@{
     CurrentPaycheck = $currentPaycheck
     CurrentPaycheckAmount = if ($currentPaycheck) { [decimal]$currentPaycheck.Amount } else { [decimal]0 }
     CurrentPaycheckDate = if ($currentPaycheck) { [datetime]$currentPaycheck.Date } else { $null }
@@ -768,6 +899,8 @@ function Get-ProjectionSummary {
     RequiredSavingsWeekly = $requiredWeekly
     ProjectedSavingsMonthly = $requiredWeekly * [decimal](52 / 12)
   }
+  $script:ProjectionSummaryCache = $result
+  return $result
 }
 
 function Get-CurrentPaycheck {
@@ -797,6 +930,7 @@ function Get-EffectiveWeeklyAvailableSavings($projection = $null) {
 }
 
 function Get-PaycheckDistribution($projection = $null) {
+  if (-not $projection -and $script:PaycheckDistributionCache) { return $script:PaycheckDistributionCache }
   if (-not $projection) { $projection = Get-ProjectionSummary }
   $paycheck = if ([decimal]$projection.CurrentPaycheckAmount -gt 0) { [decimal]$projection.CurrentPaycheckAmount } else { [decimal]$script:WeeklyAvailableSavings }
   $recurring = [math]::Min($paycheck, [decimal]$projection.RecurringWeekly)
@@ -814,7 +948,7 @@ function Get-PaycheckDistribution($projection = $null) {
     $warning = $plan.Warning
   }
 
-  return [pscustomobject]@{
+  $result = [pscustomobject]@{
     Paycheck = $paycheck
     PaycheckDate = $projection.CurrentPaycheckDate
     Recurring = $recurring
@@ -825,6 +959,8 @@ function Get-PaycheckDistribution($projection = $null) {
     Plan = $plan
     Warning = $warning
   }
+  if (-not $script:PaycheckDistributionCache) { $script:PaycheckDistributionCache = $result }
+  return $result
 }
 
 function Get-MinimumWeeklySavingsPlan([Nullable[datetime]]$asOfDate = $null, [object[]]$goalRows = $null) {
@@ -890,88 +1026,271 @@ function Get-MinimumWeeklySavingsPlan([Nullable[datetime]]$asOfDate = $null, [ob
   }
 }
 
+function Project-VectorToSimplex([double[]]$values, [double]$targetSum) {
+  $n = $values.Count
+  if ($n -le 0) { return @() }
+  if ($targetSum -le 0) { return @(0..($n - 1) | ForEach-Object { [double]0 }) }
+
+  $sorted = @($values | Sort-Object -Descending)
+  $running = [double]0
+  $theta = [double]0
+  for ($i = 0; $i -lt $n; $i++) {
+    $running += [double]$sorted[$i]
+    $candidate = ($running - $targetSum) / [double]($i + 1)
+    $nextValue = if ($i -lt ($n - 1)) { [double]$sorted[$i + 1] } else { [double]::NegativeInfinity }
+    if ([double]$sorted[$i] -gt $candidate -and $nextValue -le $candidate) {
+      $theta = $candidate
+      break
+    }
+  }
+
+  return @($values | ForEach-Object { [math]::Max([double]0, [double]$_ - $theta) })
+}
+
+function Get-GoalDeadlineWeekIndex([datetime[]]$weekDates, [datetime]$dueDate) {
+  $index = 0
+  for ($i = 0; $i -lt $weekDates.Count; $i++) {
+    if ($weekDates[$i].Date -le $dueDate.Date) {
+      $index = $i
+    }
+  }
+  return $index
+}
+
+function Test-SavingsPeakFeasible([double]$peak, [double[]]$fixedTotals, [object[]]$varGoals) {
+  if ($fixedTotals.Count -eq 0) { return $true }
+  foreach ($fixed in $fixedTotals) {
+    if ([double]$fixed -gt $peak + 0.0001) { return $false }
+  }
+
+  $deadlineIndexes = @($varGoals | ForEach-Object { [int]$_.DeadlineIndex } | Sort-Object -Unique)
+  foreach ($deadlineIndex in $deadlineIndexes) {
+    $capacity = [double]0
+    for ($w = 0; $w -le $deadlineIndex; $w++) {
+      $capacity += [math]::Max([double]0, $peak - [double]$fixedTotals[$w])
+    }
+    $required = [double](@($varGoals | Where-Object { [int]$_.DeadlineIndex -le $deadlineIndex } | Measure-Object Amount -Sum).Sum)
+    if ($capacity + 0.0001 -lt $required) { return $false }
+  }
+  return $true
+}
+
+function Get-MinimumFeasibleSavingsPeak([double[]]$fixedTotals, [object[]]$varGoals) {
+  $fixedPeak = [double]0
+  foreach ($fixed in $fixedTotals) {
+    if ([double]$fixed -gt $fixedPeak) { $fixedPeak = [double]$fixed }
+  }
+  $variableTotal = [double](@($varGoals | Measure-Object Amount -Sum).Sum)
+  if ($variableTotal -le 0) { return $fixedPeak }
+
+  $low = $fixedPeak
+  $high = $fixedPeak + $variableTotal
+  for ($i = 0; $i -lt 70; $i++) {
+    $mid = ($low + $high) / 2
+    if (Test-SavingsPeakFeasible $mid $fixedTotals $varGoals) {
+      $high = $mid
+    } else {
+      $low = $mid
+    }
+  }
+  return $high
+}
+
+function Get-OptimizedVariableSavingsAllocations([int]$weekCount, [object[]]$varGoals, [double[]]$weeklyCapacity) {
+  $nVar = $varGoals.Count
+  if ($weekCount -le 0 -or $nVar -le 0) { return @() }
+
+  $alloc = New-Object 'double[,]' $weekCount, $nVar
+  for ($g = 0; $g -lt $nVar; $g++) {
+    $goal = $varGoals[$g]
+    $deadline = [int]$goal.DeadlineIndex
+    $amount = [double]$goal.Amount
+    $avg = if ($deadline -ge 0) { $amount / [double]($deadline + 1) } else { [double]0 }
+    for ($w = 0; $w -le $deadline; $w++) {
+      $alloc[$w, $g] = $avg
+    }
+  }
+
+  for ($iteration = 0; $iteration -lt 120; $iteration++) {
+    for ($w = 0; $w -lt $weekCount; $w++) {
+      $rowValues = New-Object double[] $nVar
+      $rowSum = [double]0
+      for ($g = 0; $g -lt $nVar; $g++) {
+        $goal = $varGoals[$g]
+        $value = if ($w -le [int]$goal.DeadlineIndex) { [double]$alloc[$w, $g] } else { [double]0 }
+        $rowValues[$g] = $value
+        $rowSum += $value
+      }
+      $capacity = [math]::Max([double]0, [double]$weeklyCapacity[$w])
+      if ($rowSum -gt $capacity + 0.0001) {
+        $projected = @(Project-VectorToSimplex $rowValues $capacity)
+        for ($g = 0; $g -lt $nVar; $g++) {
+          $alloc[$w, $g] = if ($w -le [int]$varGoals[$g].DeadlineIndex) { [double]$projected[$g] } else { [double]0 }
+        }
+      } else {
+        for ($g = 0; $g -lt $nVar; $g++) {
+          if ($w -gt [int]$varGoals[$g].DeadlineIndex) { $alloc[$w, $g] = [double]0 }
+        }
+      }
+    }
+
+    for ($g = 0; $g -lt $nVar; $g++) {
+      $goal = $varGoals[$g]
+      $deadline = [int]$goal.DeadlineIndex
+      $columnValues = New-Object double[] ($deadline + 1)
+      for ($w = 0; $w -le $deadline; $w++) {
+        $columnValues[$w] = [double]$alloc[$w, $g]
+      }
+      $projected = @(Project-VectorToSimplex $columnValues ([double]$goal.Amount))
+      for ($w = 0; $w -le $deadline; $w++) {
+        $alloc[$w, $g] = [double]$projected[$w]
+      }
+      for ($w = $deadline + 1; $w -lt $weekCount; $w++) {
+        $alloc[$w, $g] = [double]0
+      }
+    }
+  }
+
+  return ,$alloc
+}
+
 function Get-MinimumSavingsProjection {
+  if ($script:MinimumSavingsProjectionCache) { return $script:MinimumSavingsProjectionCache }
   $goalRows = @(Get-GoalProgressRows | ForEach-Object {
     [pscustomobject]@{ Goal = $_.Goal; Saved = [decimal]$_.Saved; Remaining = [decimal]$_.Remaining }
   })
-  $plan = Get-MinimumWeeklySavingsPlan -asOfDate ([datetime]::Today) -goalRows $goalRows
-  $weeklyRate = [decimal]$plan.MinimumWeeklyRate
-  $latestDue = @($script:Goals | Where-Object { -not $_.IsOngoing } | Sort-Object ExpectedDate -Descending | Select-Object -First 1)[0]
-  $maxWeeks = if ($latestDue) { [math]::Max(12, [math]::Ceiling((([datetime]$latestDue.ExpectedDate - [datetime]::Today).TotalDays) / 7)) } else { 12 }
+  $today = [datetime]::Today
+  $latestDue = @($script:Goals |
+    Where-Object { (Get-GoalKind $_) -ne "Weekly" -or -not $_.IsOngoing } |
+    Sort-Object ExpectedDate -Descending |
+    Select-Object -First 1)[0]
+  $maxWeeks = if ($latestDue) { [math]::Max(1, [math]::Floor((([datetime]$latestDue.ExpectedDate - $today).TotalDays) / 7) + 1) } else { 12 }
   if (@($script:Goals | Where-Object { (Get-GoalKind $_) -eq "Weekly" -and $_.IsOngoing }).Count -gt 0) {
     $maxWeeks = [math]::Max($maxWeeks, 52)
   }
-  $maxWeeks = [math]::Min(104, $maxWeeks)
+  $maxWeeks = [math]::Min(104, [math]::Max(1, $maxWeeks))
+  $weekDates = New-Object datetime[] $maxWeeks
+  for ($w = 0; $w -lt $maxWeeks; $w++) {
+    $weekDates[$w] = $today.AddDays($w * 7)
+  }
+
+  $fixedAlloc = New-Object 'double[,]' $maxWeeks, $goalRows.Count
+  $fixedTotals = New-Object double[] $maxWeeks
+  $varGoals = New-Object System.Collections.ArrayList
+  for ($g = 0; $g -lt $goalRows.Count; $g++) {
+    $goalRow = $goalRows[$g]
+    $goal = $goalRow.Goal
+    if ((Get-GoalKind $goal) -eq "Weekly") {
+      $weeklyAmount = [double](Get-GoalWeeklyAmount $goal)
+      if ($weeklyAmount -le 0) { continue }
+      for ($w = 0; $w -lt $maxWeeks; $w++) {
+        $active = if ($goal.IsOngoing) { $true } else { $weekDates[$w].Date -le ([datetime]$goal.ExpectedDate).Date }
+        if ($active) {
+          $fixedAlloc[$w, $g] = $weeklyAmount
+          $fixedTotals[$w] += $weeklyAmount
+        }
+      }
+      continue
+    }
+
+    $remaining = [double]$goalRow.Remaining
+    if ($remaining -le 0) { continue }
+    $deadlineIndex = Get-GoalDeadlineWeekIndex $weekDates ([datetime]$goal.ExpectedDate)
+    [void]$varGoals.Add([pscustomobject]@{
+      GoalIndex = $g
+      Goal = $goal
+      Amount = $remaining
+      DeadlineIndex = $deadlineIndex
+    })
+  }
+
+  $peakWeekly = Get-MinimumFeasibleSavingsPeak $fixedTotals @($varGoals)
+  $weeklyCapacity = New-Object double[] $maxWeeks
+  for ($w = 0; $w -lt $maxWeeks; $w++) {
+    $weeklyCapacity[$w] = [math]::Max([double]0, [double]$peakWeekly - [double]$fixedTotals[$w])
+  }
+  $varAlloc = Get-OptimizedVariableSavingsAllocations $maxWeeks @($varGoals) $weeklyCapacity
   $points = New-Object System.Collections.ArrayList
 
-  for ($week = 0; $week -le $maxWeeks; $week++) {
-    $date = [datetime]::Today.AddDays($week * 7)
-    $remainingBudget = $weeklyRate
-    foreach ($goalRow in @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -eq "Weekly" -and (Test-WeeklyGoalActive $_.Goal $date) } | Sort-Object { Get-GoalSortDate $_.Goal })) {
-      $allocation = [math]::Min($remainingBudget, (Get-GoalWeeklyAmount $goalRow.Goal))
+  for ($week = 0; $week -lt $maxWeeks; $week++) {
+    $date = $weekDates[$week]
+    for ($g = 0; $g -lt $goalRows.Count; $g++) {
+      $allocation = [decimal]$fixedAlloc.GetValue($week, $g)
       if ($allocation -le 0) { continue }
+      $goal = $goalRows[$g].Goal
       [void]$points.Add([pscustomobject]@{
         Week = $week
         Date = $date
-        GoalId = $goalRow.Goal.Id
-        GoalName = $goalRow.Goal.Name
-        Allocation = [decimal]$allocation
-        TotalAllocated = [decimal]$weeklyRate
+        GoalId = $goal.Id
+        GoalName = $goal.Name
+        Allocation = $allocation
+        TotalAllocated = [decimal]$peakWeekly
       })
-      $remainingBudget -= $allocation
     }
-    foreach ($goalRow in @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -ne "Weekly" -and [decimal]$_.Remaining -gt 0 } | Sort-Object { [datetime]$_.Goal.ExpectedDate })) {
-      if ($remainingBudget -le 0) { break }
-      $allocation = [math]::Min([decimal]$goalRow.Remaining, $remainingBudget)
-      if ($allocation -le 0) { continue }
+
+    for ($i = 0; $i -lt $varGoals.Count; $i++) {
+      $allocation = [decimal]$varAlloc.GetValue($week, $i)
+      if ($allocation -le [decimal]0.005) { continue }
+      $goal = $varGoals[$i].Goal
       [void]$points.Add([pscustomobject]@{
         Week = $week
         Date = $date
-        GoalId = $goalRow.Goal.Id
-        GoalName = $goalRow.Goal.Name
-        Allocation = [decimal]$allocation
-        TotalAllocated = [decimal]$weeklyRate
+        GoalId = $goal.Id
+        GoalName = $goal.Name
+        Allocation = $allocation
+        TotalAllocated = [decimal]$peakWeekly
       })
-      $goalRow.Remaining = [math]::Max([decimal]0, [decimal]$goalRow.Remaining - $allocation)
-      $remainingBudget -= $allocation
-    }
-    $hasTargetRemaining = @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -ne "Weekly" -and [decimal]$_.Remaining -gt 0 }).Count -gt 0
-    $hasActiveWeekly = @($goalRows | Where-Object { (Get-GoalKind $_.Goal) -eq "Weekly" -and (Test-WeeklyGoalActive $_.Goal $date.AddDays(7)) }).Count -gt 0
-    if (-not $hasTargetRemaining -and -not $hasActiveWeekly) { break }
+      }
   }
 
-  return [pscustomobject]@{
-    MinimumWeeklyRate = $weeklyRate
+  $plan = Get-MinimumWeeklySavingsPlan -asOfDate $today -goalRows $goalRows
+  $result = [pscustomobject]@{
+    MinimumWeeklyRate = [decimal]$peakWeekly
     Points = @($points)
     Plan = $plan
+    Warning = [string]$plan.Warning
   }
+  $script:MinimumSavingsProjectionCache = $result
+  return $result
+}
+
+function Get-ProjectedSavingsAllocationForRange([datetime]$rangeStart, [datetime]$rangeEnd, [string]$account = "All Accounts") {
+  $startDate = $rangeStart.Date
+  $endDate = $rangeEnd.Date
+  if ($endDate -lt $startDate) { return [decimal]0 }
+
+  $goalAccounts = @{}
+  foreach ($goal in @($script:Goals)) {
+    if ($goal.Id) {
+      $goalAccounts[[string]$goal.Id] = [string]$goal.Account
+    }
+  }
+
+  $total = [decimal]0
+  foreach ($point in @((Get-MinimumSavingsProjection).Points)) {
+    $goalId = [string]$point.GoalId
+    if ($account -and $account -ne "All Accounts") {
+      $goalAccount = if ($goalAccounts.ContainsKey($goalId)) { [string]$goalAccounts[$goalId] } else { "" }
+      if ($goalAccount -ne $account) { continue }
+    }
+
+    $weekStart = ([datetime]$point.Date).Date
+    $weekEnd = $weekStart.AddDays(6)
+    $overlapStart = if ($weekStart -gt $startDate) { $weekStart } else { $startDate }
+    $overlapEnd = if ($weekEnd -lt $endDate) { $weekEnd } else { $endDate }
+    if ($overlapEnd -lt $overlapStart) { continue }
+
+    $overlapDays = [decimal]((New-TimeSpan -Start $overlapStart -End $overlapEnd).Days + 1)
+    $total += ([decimal]$point.Allocation) * ($overlapDays / [decimal]7)
+  }
+
+  return $total
 }
 
 function Get-ProjectedMonthlyGoalSavings([datetime]$monthDate) {
   $monthStart = New-Object datetime ($monthDate.Year, $monthDate.Month, 1)
   $monthEnd = $monthStart.AddMonths(1).AddDays(-1)
-  $today = [datetime]::Today
-  $total = [decimal]0
-
-  foreach ($row in Get-GoalProgressRows) {
-    $goal = $row.Goal
-    $remaining = [decimal]$row.Remaining
-    if ($remaining -le 0) { continue }
-
-    $dueDate = [datetime]$goal.ExpectedDate
-    if ($dueDate -lt $monthStart) { continue }
-
-    $projectionStart = if ($monthStart -lt $today) { $today } else { $monthStart }
-    if ($projectionStart -gt $monthEnd) { continue }
-
-    $daysUntilDue = [math]::Max(1, ($dueDate - $today).TotalDays)
-    $dailyRequired = $remaining / [decimal]$daysUntilDue
-    $projectionEnd = if ($dueDate -lt $monthEnd) { $dueDate } else { $monthEnd }
-    $activeDaysThisMonth = [math]::Max(0, ($projectionEnd - $projectionStart).TotalDays + 1)
-    $total += $dailyRequired * [decimal]$activeDaysThisMonth
-  }
-
-  return $total
+  return Get-ProjectedSavingsAllocationForRange $monthStart $monthEnd "All Accounts"
 }
 
 function Get-ProjectedMonthlyGoalSend([datetime]$monthDate) {
@@ -1040,26 +1359,7 @@ function Get-HistoricalAccountBalance([datetime]$monthDate, [string]$account) {
 function Get-ProjectedAccountGoalSavings([datetime]$monthDate, [string]$account) {
   $monthStart = New-Object datetime ($monthDate.Year, $monthDate.Month, 1)
   $monthEnd = $monthStart.AddMonths(1).AddDays(-1)
-  $today = [datetime]::Today
-  $total = [decimal]0
-
-  foreach ($row in Get-GoalProgressRows) {
-    $goal = $row.Goal
-    if ($goal.Account -ne $account) { continue }
-    $remaining = [decimal]$row.Remaining
-    if ($remaining -le 0) { continue }
-    $dueDate = [datetime]$goal.ExpectedDate
-    if ($dueDate -lt $monthStart) { continue }
-    $projectionStart = if ($monthStart -lt $today) { $today } else { $monthStart }
-    if ($projectionStart -gt $monthEnd) { continue }
-    $daysUntilDue = [math]::Max(1, ($dueDate - $today).TotalDays)
-    $dailyRequired = $remaining / [decimal]$daysUntilDue
-    $projectionEnd = if ($dueDate -lt $monthEnd) { $dueDate } else { $monthEnd }
-    $activeDaysThisMonth = [math]::Max(0, ($projectionEnd - $projectionStart).TotalDays + 1)
-    $total += $dailyRequired * [decimal]$activeDaysThisMonth
-  }
-
-  return $total
+  return Get-ProjectedSavingsAllocationForRange $monthStart $monthEnd $account
 }
 
 function Get-ProjectedAccountGoalSend([datetime]$monthDate, [string]$account) {
@@ -1126,6 +1426,7 @@ function Add-ZeroAxisLine($chart) {
 }
 
 function Save-Entries {
+  Clear-ComputedCaches
   $payload = [pscustomobject]@{
     entries = @($script:Entries)
     goals = @($script:Goals)
@@ -1156,6 +1457,7 @@ function New-AutoBackup([string]$reason) {
 }
 
 function Load-Entries {
+  Clear-ComputedCaches
   $script:Entries.Clear()
   $script:Goals.Clear()
   $script:RecurringExclusions = @{}
@@ -1371,7 +1673,8 @@ function Get-ThisWeekBudgetSummary([string]$selectedAccount = "All Accounts") {
       $recurringBills += [decimal]$payment.Amount
     }
   }
-  $bills = $billTransactions + $recurringBills
+  $creditCardPayoff = Get-WeeklyCreditCardPayoffAmount $selectedAccount
+  $bills = $billTransactions + $recurringBills + $creditCardPayoff
   $remaining = $paycheck - $savings - $spend - $bills
 
   return [pscustomobject]@{
@@ -1380,8 +1683,23 @@ function Get-ThisWeekBudgetSummary([string]$selectedAccount = "All Accounts") {
     Savings = $savings
     Spend = $spend
     Bills = $bills
+    CreditCardPayoff = $creditCardPayoff
     Remaining = $remaining
   }
+}
+
+function Get-WeeklyCreditCardPayoffAmount([string]$selectedAccount = "All Accounts") {
+  $total = [decimal]0
+  foreach ($row in Get-CalculatedAccountBalances) {
+    $account = [string]$row.Account
+    if ($selectedAccount -ne "All Accounts" -and $account -ne $selectedAccount) { continue }
+    if (-not (Test-CreditCardAccount $account)) { continue }
+    $balance = [decimal]$row.Balance
+    if ($balance -lt 0) {
+      $total += [math]::Abs($balance)
+    }
+  }
+  return $total
 }
 
 function Get-ThisWeekBudgetRows([string]$selectedAccount = "All Accounts") {
@@ -1392,7 +1710,7 @@ function Get-ThisWeekBudgetRows([string]$selectedAccount = "All Accounts") {
     [pscustomobject]@{ Item = "Paycheck"; Amount = ConvertTo-Money ([decimal]$budget.Paycheck); Detail = "Income marked inside this Monday budget week" }
     [pscustomobject]@{ Item = "Savings"; Amount = ConvertTo-Money ([decimal]$budget.Savings); Detail = "Minimum weekly saving to hit active goals" }
     [pscustomobject]@{ Item = "Spend"; Amount = ConvertTo-Money ([decimal]$budget.Spend); Detail = "Expenses, excluding transfers" }
-    [pscustomobject]@{ Item = "Bills"; Amount = ConvertTo-Money ([decimal]$budget.Bills); Detail = "Recurring payments due this week plus bill entries" }
+    [pscustomobject]@{ Item = "Bills"; Amount = ConvertTo-Money ([decimal]$budget.Bills); Detail = "Due bills, recurring payments, and credit card payoff" }
     [pscustomobject]@{ Item = "Remaining"; Amount = ConvertTo-Money ([decimal]$budget.Remaining); Detail = "Paycheck minus savings, spend, and bills" }
   )
 }
@@ -1564,8 +1882,6 @@ function Refresh-Summary {
 }
 
 function Refresh-Chart {
-  $script:ChartProjectionCache = Get-ProjectionSummary
-  $script:ChartDistributionCache = Get-PaycheckDistribution $script:ChartProjectionCache
   try {
     if ($chart) {
       Render-Chart $chart $chartDataTable $graphModeCombo $chartTitleLabel $projectionSummaryLabel
@@ -1573,10 +1889,7 @@ function Refresh-Chart {
     if ($chart2) {
       Render-Chart $chart2 $chartDataTable2 $graphModeCombo2 $chartTitleLabel2 $projectionSummaryLabel2
     }
-  } finally {
-    $script:ChartProjectionCache = $null
-    $script:ChartDistributionCache = $null
-  }
+  } finally {}
 }
 
 function Render-BudgetDataTable($dataTable, [string]$selectedAccount) {
@@ -1612,13 +1925,13 @@ function Render-Chart($chart, $dataTable, $graphModeCombo, $chartTitleLabel, $pr
   if ($chart) { $chart.Visible = $true }
   if ($dataTable) { $dataTable.Visible = $false }
 
-  $projection = if ($script:ChartProjectionCache) { $script:ChartProjectionCache } else { Get-ProjectionSummary }
-  $distribution = if ($script:ChartDistributionCache) { $script:ChartDistributionCache } else { Get-PaycheckDistribution $projection }
-  $effectiveWeeklySavings = [decimal]$distribution.AvailableForSavings
   $minimumProjection = if ($graphMode -eq "Savings Projection") { Get-MinimumSavingsProjection } else { $null }
   $minimumWeeklyRate = if ($minimumProjection) { [decimal]$minimumProjection.MinimumWeeklyRate } else { [decimal]0 }
   $hasAllocationProjection = ($graphMode -eq "Savings Projection" -and $minimumWeeklyRate -gt 0 -and $script:Goals.Count -gt 0)
   if ($hasAllocationProjection) {
+    $projection = Get-ProjectionSummary
+    $distribution = Get-PaycheckDistribution $projection
+    $effectiveWeeklySavings = [decimal]$distribution.AvailableForSavings
     if ($chartTitleLabel) { $chartTitleLabel.Text = "Savings Projection" }
     $chartTitle = New-Object System.Windows.Forms.DataVisualization.Charting.Title
     $chartTitle.Text = "Minimum Weekly Savings Projection - $(Get-ChartScopeLabel)"
@@ -1904,7 +2217,7 @@ function Render-Chart($chart, $dataTable, $graphModeCombo, $chartTitleLabel, $pr
   }
   $seriesNames = switch ($graphMode) {
     "Income vs Spend" { if ($isSavingsIncomeSpend) { @("Credit + Interest", "Payments", "Net") } else { @("Income", "Out", "Net") } }
-    default { @("Out", "Saved", "Net", "Projected") }
+    default { @("Out", "Saved", "Net") }
   }
   foreach ($seriesName in $seriesNames) {
     $series = New-Object System.Windows.Forms.DataVisualization.Charting.Series $seriesName
@@ -1927,7 +2240,7 @@ function Render-Chart($chart, $dataTable, $graphModeCombo, $chartTitleLabel, $pr
   }
 
   $allValues = New-Object System.Collections.ArrayList
-  $flowBuckets = Get-ChartBuckets 6
+  $flowBuckets = Get-ChartBuckets $(if ($graphMode -eq "Monthly Flow") { 0 } else { 6 })
   foreach ($bucket in $flowBuckets) {
     $items = @($script:Entries | Where-Object {
       $entryDate = if ($null -ne $_.Date) { [datetime]$_.Date } else { [datetime]::MinValue }
@@ -1936,7 +2249,7 @@ function Render-Chart($chart, $dataTable, $graphModeCombo, $chartTitleLabel, $pr
       (($selectedAccount -eq "All Accounts") -or ($_.Account -eq $selectedAccount))
     })
     $out = [decimal](@($items | Where-Object { $_.Type -in @("Expense", "Bill") -and -not (Test-InternalTransfer $_) } | Measure-Object Amount -Sum).Sum)
-    $saved = [decimal](@($items | Where-Object { Test-GoalSavingEntry $_ } | Measure-Object Amount -Sum).Sum)
+    $saved = Get-ActualSavingsAmount $items $selectedAccount
     $income = [decimal](@($items | Where-Object Type -eq "Income" | Measure-Object Amount -Sum).Sum)
     $savingsCredit = [decimal](@($items | Where-Object { Test-SavingsAccountCredit $_ } | Measure-Object Amount -Sum).Sum)
     $savingsPayments = [decimal](@($items | Where-Object { Test-SavingsAccountPayment $_ } | Measure-Object Amount -Sum).Sum)
@@ -1973,25 +2286,6 @@ function Render-Chart($chart, $dataTable, $graphModeCombo, $chartTitleLabel, $pr
       if ($targetSeries) { [void]$targetSeries.Points.Add($point) }
       if (-not $point.IsEmpty) { [void]$allValues.Add([double]$pair[1]) }
     }
-
-    $projectedSeries = $chart.Series.FindByName("Projected")
-    if ($projectedSeries) {
-      $projectionPoint = New-Object System.Windows.Forms.DataVisualization.Charting.DataPoint
-      $projectionPoint.SetValueXY([int]$bucket.Index, 0)
-      $projectionPoint.AxisLabel = [string]$bucket.Label
-      $projectionPoint.IsEmpty = $true
-      if (([datetime]$bucket.End).Date -ge [datetime]::Today) {
-        $projectedValue = if ((Get-SelectedMonthRange)) {
-          ([decimal](Get-MinimumWeeklySavingsPlan).MinimumWeeklyRate / [decimal]7)
-        } else {
-          Get-ProjectedMonthlyGoalSavings ([datetime]$bucket.Start)
-        }
-        $projectionPoint.YValues[0] = [double]$projectedValue
-        $projectionPoint.IsEmpty = $false
-        [void]$allValues.Add([double]$projectedValue)
-      }
-      [void]$projectedSeries.Points.Add($projectionPoint)
-    }
   }
 
   $maxValue = 0
@@ -2003,11 +2297,12 @@ function Render-Chart($chart, $dataTable, $graphModeCombo, $chartTitleLabel, $pr
   Set-ChartAxisScale $chart $minValue $maxValue $flowBuckets.Count
   Add-ZeroAxisLine $chart
 
+  $projection = Get-ProjectionSummary
   $projectionSummaryLabel.Text = "Recent spend/wk: $(ConvertTo-Money $projection.WeeklySpend)    Required savings/wk: $(ConvertTo-Money $projection.RequiredSavingsWeekly)"
 }
 
 function Refresh-Allocation {
-  if (-not $allocationGrid) { return }
+  if (-not $allocationGrid -or -not $allocationGrid.Visible) { return }
   $allocationGrid.Rows.Clear()
   $projection = Get-ProjectionSummary
   $distribution = Get-PaycheckDistribution $projection
@@ -2182,6 +2477,7 @@ function Refresh-Grid {
 }
 
 function Refresh-All {
+  Clear-ComputedCaches
   if ($form) { $form.SuspendLayout() }
   if ($grid) { $grid.SuspendLayout() }
   if ($categoryList) { $categoryList.SuspendLayout() }
